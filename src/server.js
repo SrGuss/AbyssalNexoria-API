@@ -127,17 +127,60 @@ app.get('/v1/site/store/catalog', (_req, res) => {
 });
 
 const paymentLimit = rateLimit({ windowMs: 60000, max: 5, keyFn: (r) => `pay:${r.ip}:${r.accountId || ''}` });
-app.post('/v1/site/store/orders', siteAuth, paymentLimit, async (req, res) => {
+function finalizeApprovedPayment(order, payment) {
+  const items = db.prepare('SELECT * FROM store_order_items WHERE order_id=?').all(order.id);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const updated = db.prepare(`UPDATE store_orders SET status='paid',payment_id=?,updated_at=datetime('now')
+      WHERE id=? AND status='pending'`).run(String(payment.id), order.id);
+    if (updated.changes) {
+      const command = db.prepare('INSERT OR IGNORE INTO commands(event_id,account_id,type,payload) VALUES(?,?,?,?)');
+      for (const item of items) {
+        const type = item.kind === 'vip' ? 'GRANT_VIP' : 'STORE_PRODUCT';
+        const payload = JSON.stringify({
+          orderId: order.id, productId: item.product_id, productName: item.name, quantity: item.quantity,
+          group: item.vip_group, durationDays: item.duration_days, productCode: item.product_code,
+        });
+        command.run(`mp:${payment.id}:${item.id}`, order.account_id, type, payload);
+      }
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  if (order.status !== 'paid') audit('mercadopago', 'store_payment_approved', order.id);
+}
+
+app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => {
   const accessToken = process.env.MP_ACCESS_TOKEN;
   const webhookSecret = process.env.MP_WEBHOOK_SECRET;
   const webhookUrl = process.env.MP_WEBHOOK_URL;
-  const siteUrl = (process.env.SITE_URL || '').replace(/\/$/, '');
-  if (!accessToken || !webhookSecret || !webhookUrl || !siteUrl)
+  if (!accessToken || !webhookSecret || !webhookUrl)
     return res.status(503).json({ error: 'payments_not_configured' });
 
   const requested = req.body?.items;
   if (!Array.isArray(requested) || requested.length < 1 || requested.length > 20)
     return res.status(400).json({ error: 'invalid_cart' });
+  const form = req.body?.payment;
+  const methodId = typeof form?.payment_method_id === 'string' ? form.payment_method_id : '';
+  const payer = form?.payer || {};
+  const email = typeof payer.email === 'string' ? payer.email.trim().toLowerCase() : '';
+  const identificationType = typeof payer.identification?.type === 'string' ? payer.identification.type.trim() : '';
+  const identificationNumber = typeof payer.identification?.number === 'string'
+    ? payer.identification.number.replace(/\D/g, '') : '';
+  if (!/^[a-z0-9_-]{2,64}$/i.test(methodId) || email.length > 254
+    || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    || !/^[a-z0-9_-]{1,16}$/i.test(identificationType)
+    || !/^\d{5,20}$/.test(identificationNumber))
+    return res.status(400).json({ error: 'invalid_payment_data' });
+  const paymentToken = typeof form.token === 'string' ? form.token : '';
+  const isCard = !!paymentToken;
+  if ((isCard && (paymentToken.length > 2048 || !Number.isSafeInteger(Number(form.installments))
+      || Number(form.installments) < 1 || Number(form.installments) > 24))
+    || (!isCard && methodId !== 'pix' && methodId !== 'bolbradesco'))
+    return res.status(400).json({ error: 'invalid_payment_data' });
+
   const quantities = new Map();
   for (const item of requested) {
     const id = Number(item?.id), quantity = Number(item?.quantity);
@@ -167,35 +210,64 @@ app.post('/v1/site/store/orders', siteAuth, paymentLimit, async (req, res) => {
     throw error;
   }
 
-  const preference = {
-    external_reference: orderId,
-    notification_url: webhookUrl,
-    back_urls: {
-      success: `${siteUrl}/?payment=success`,
-      pending: `${siteUrl}/?payment=pending`,
-      failure: `${siteUrl}/?payment=failure`,
-    },
-    auto_return: 'approved',
-    items: products.map(product => ({
-      id: String(product.id), title: product.name, description: product.description.slice(0, 250),
-      quantity: quantities.get(product.id), currency_id: 'BRL', unit_price: product.priceCents / 100,
-    })),
-  };
   const mpBase = (process.env.MP_API_URL || 'https://api.mercadopago.com').replace(/\/$/, '');
   try {
-    const response = await fetch(`${mpBase}/checkout/preferences`, {
-      method: 'POST', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'X-Idempotency-Key': orderId },
-      body: JSON.stringify(preference), signal: AbortSignal.timeout(10000),
+    const paymentRequest = {
+      transaction_amount: amountCents / 100,
+      description: products.map(product => product.name).join(', ').slice(0, 250),
+      payment_method_id: methodId,
+      payer: {
+        email,
+        identification: { type: identificationType, number: identificationNumber },
+      },
+      external_reference: orderId,
+      notification_url: webhookUrl,
+    };
+    for (const key of ['first_name', 'last_name']) {
+      const value = typeof payer[key] === 'string' ? payer[key].trim().slice(0, 80) : '';
+      if (value) paymentRequest.payer[key] = value;
+    }
+    if (isCard) {
+      paymentRequest.token = paymentToken;
+      paymentRequest.installments = Number(form.installments);
+      if (/^\d+$/.test(String(form.issuer_id || ''))) paymentRequest.issuer_id = String(form.issuer_id);
+      if (typeof form.payment_method_option_id === 'string') paymentRequest.payment_method_option_id = form.payment_method_option_id;
+    }
+    const response = await fetch(`${mpBase}/v1/payments`, {
+      method: 'POST', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'X-Idempotency-Key': randomUUID() },
+      body: JSON.stringify(paymentRequest), signal: AbortSignal.timeout(15000),
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.id || !data.init_point) throw new Error('preference_failed');
-    db.prepare("UPDATE store_orders SET preference_id=?,updated_at=datetime('now') WHERE id=?")
-      .run(data.id, orderId);
-    res.status(201).json({ orderId, checkoutUrl: data.init_point });
+    if (!response.ok || !data.id || !data.status) {
+      db.prepare("UPDATE store_orders SET status='failed',updated_at=datetime('now') WHERE id=? AND status='pending'").run(orderId);
+      return res.status(402).json({ error: 'payment_rejected' });
+    }
+    const order = db.prepare('SELECT * FROM store_orders WHERE id=?').get(orderId);
+    if (data.status === 'approved') {
+      if (data.currency_id !== 'BRL' || Math.round(Number(data.transaction_amount) * 100) !== amountCents)
+        return res.status(502).json({ error: 'payment_verification_failed' });
+      finalizeApprovedPayment(order, data);
+    } else {
+      const status = ['rejected', 'cancelled'].includes(data.status) ? 'failed' : 'pending';
+      db.prepare("UPDATE store_orders SET status=?,payment_id=?,updated_at=datetime('now') WHERE id=? AND status='pending'")
+        .run(status, String(data.id), orderId);
+    }
+    res.status(data.status === 'approved' ? 201 : 202).json({
+      orderId, status: data.status, statusDetail: data.status_detail || null,
+      pixQrCode: data.point_of_interaction?.transaction_data?.qr_code || null,
+      pixQrCodeBase64: data.point_of_interaction?.transaction_data?.qr_code_base64 || null,
+      ticketUrl: data.transaction_details?.external_resource_url || null,
+    });
   } catch {
     db.prepare("UPDATE store_orders SET status='failed',updated_at=datetime('now') WHERE id=? AND status='pending'").run(orderId);
     res.status(502).json({ error: 'checkout_unavailable' });
   }
+});
+
+app.get('/v1/site/store/orders/:id', siteAuth, (req, res) => {
+  const order = db.prepare('SELECT id,status FROM store_orders WHERE id=? AND account_id=?').get(req.params.id, req.accountId);
+  if (!order) return res.sendStatus(404);
+  res.json(order);
 });
 
 function validPaymentSignature(req, paymentId) {
@@ -230,28 +302,7 @@ app.post('/v1/site/payments/webhook', async (req, res) => {
       return res.sendStatus(200);
     if (order.status === 'paid') return res.sendStatus(200);
 
-    const items = db.prepare('SELECT * FROM store_order_items WHERE order_id=?').all(orderId);
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const updated = db.prepare(`UPDATE store_orders SET status='paid',payment_id=?,updated_at=datetime('now')
-        WHERE id=? AND status='pending'`).run(String(payment.id), orderId);
-      if (updated.changes) {
-        const command = db.prepare('INSERT OR IGNORE INTO commands(event_id,account_id,type,payload) VALUES(?,?,?,?)');
-        for (const item of items) {
-          const type = item.kind === 'vip' ? 'GRANT_VIP' : 'STORE_PRODUCT';
-          const payload = JSON.stringify({
-            orderId, productId: item.product_id, productName: item.name, quantity: item.quantity,
-            group: item.vip_group, durationDays: item.duration_days, productCode: item.product_code,
-          });
-          command.run(`mp:${payment.id}:${item.id}`, order.account_id, type, payload);
-        }
-      }
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
-    if (order.status !== 'paid') audit('mercadopago', 'store_payment_approved', orderId);
+    finalizeApprovedPayment(order, payment);
     res.sendStatus(200);
   } catch {
     res.sendStatus(502);
