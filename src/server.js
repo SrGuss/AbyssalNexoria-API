@@ -169,9 +169,13 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
   const identificationType = typeof payer.identification?.type === 'string' ? payer.identification.type.trim() : '';
   const identificationNumber = typeof payer.identification?.number === 'string'
     ? payer.identification.number.replace(/\D/g, '') : '';
+  const validIdentification = /^[a-z0-9_-]{1,16}$/i.test(identificationType)
+    && /^\d{5,20}$/.test(identificationNumber);
   if (!/^[a-z0-9_-]{2,64}$/i.test(methodId) || email.length > 254
     || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
     return res.status(400).json({ error: 'invalid_payment_data' });
+  if (methodId === 'pix' && !validIdentification)
+    return res.status(400).json({ error: 'pix_identification_required' });
   const paymentToken = typeof form.token === 'string' ? form.token : '';
   const isCard = !!paymentToken;
   if ((isCard && (paymentToken.length > 2048 || !Number.isSafeInteger(Number(form.installments))
@@ -244,7 +248,11 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
       })) : [];
       console.error('[mercadopago] payment request rejected', response.status, JSON.stringify({ message: data.message, causes }));
       db.prepare("UPDATE store_orders SET status='failed',updated_at=datetime('now') WHERE id=? AND status='pending'").run(orderId);
-      return res.status(402).json({ error: 'payment_rejected' });
+      return res.status(402).json({
+        error: 'payment_rejected',
+        statusDetail: typeof data.status_detail === 'string' ? data.status_detail.slice(0, 80) : null,
+        causeCodes: causes.map(cause => cause.code).filter(Boolean).slice(0, 3),
+      });
     }
     const order = db.prepare('SELECT * FROM store_orders WHERE id=?').get(orderId);
     if (data.status === 'approved') {
@@ -255,6 +263,10 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
       const status = ['rejected', 'cancelled'].includes(data.status) ? 'failed' : 'pending';
       db.prepare("UPDATE store_orders SET status=?,payment_id=?,updated_at=datetime('now') WHERE id=? AND status='pending'")
         .run(status, String(data.id), orderId);
+      if (status === 'failed') return res.status(402).json({
+        error: 'payment_rejected',
+        statusDetail: typeof data.status_detail === 'string' ? data.status_detail.slice(0, 80) : null,
+      });
     }
     res.status(data.status === 'approved' ? 201 : 202).json({
       orderId, status: data.status, statusDetail: data.status_detail || null,
