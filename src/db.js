@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS admin_credentials (
   pw_hash TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS admin_staff (
+  account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  role_key TEXT NOT NULL CHECK(role_key IN ('admin','moderator','helper')),
+  created_by INTEGER NOT NULL REFERENCES accounts(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS admin_challenges (
   account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   token_hash TEXT NOT NULL,

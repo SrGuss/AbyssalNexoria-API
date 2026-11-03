@@ -124,15 +124,19 @@ const adminCookieOpts = `HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${HOURS
 const readAdminCookie = (req) => (req.get('cookie') || '').split(';').map(s => s.trim()).find(s => s.startsWith('admin_sid='))?.slice(10);
 const getAdminCredential = (accountId) => db.prepare('SELECT * FROM admin_credentials WHERE account_id=?').get(accountId);
 
-function adminOwner(nick) {
-  if (!ADMIN_OWNER_NICK || !NICK_RE.test(nick || '') || normNick(nick) !== ADMIN_OWNER_NICK) return null;
-  return getAccount(nick);
+function adminStaff(accountId) {
+  return db.prepare('SELECT role_key FROM admin_staff WHERE account_id=?').get(accountId);
+}
+
+function isAdminOwner(account) {
+  return !!(ADMIN_OWNER_NICK && account && normNick(account.display_nick) === ADMIN_OWNER_NICK);
 }
 
 async function verifyAdminServerPassword(nick, password) {
-  const account = adminOwner(nick);
+  const account = NICK_RE.test(nick || '') ? getAccount(nick) : null;
   const value = typeof password === 'string' ? password : '';
-  if (!account) { await dummyVerify(value); return null; }
+  const isAllowed = account && (isAdminOwner(account) || adminStaff(account.id));
+  if (!isAllowed) { await dummyVerify(value); return null; }
   if (value.length > 128) { await dummyVerify(value); return null; }
   if (!(await verifyPassword(value, rec(account)))) return null;
   await upgradeHash(account, value);
@@ -169,8 +173,20 @@ function adminAuth(req, res, next) {
     if (token) db.prepare('DELETE FROM admin_sessions WHERE token_hash=?').run(sha256(token));
     return res.status(401).json({ error: 'unauthenticated' });
   }
+  const account = db.prepare('SELECT id,display_nick FROM accounts WHERE id=?').get(session.account_id);
+  const staff = adminStaff(session.account_id);
+  if (!account || !getAdminCredential(session.account_id) || (!isAdminOwner(account) && !staff))
+    return res.status(401).json({ error: 'admin_access_revoked' });
   req.adminAccountId = session.account_id;
+  req.adminNick = account.display_nick;
+  req.adminRole = isAdminOwner(account) ? 'owner' : staff.role_key;
   next();
+}
+
+function requireAdminRoles(...roles) {
+  return (req, res, next) => roles.includes(req.adminRole)
+    ? next()
+    : res.status(403).json({ error: 'forbidden' });
 }
 
 app.get('/v1/site/admin/status', (_req, res) => {
@@ -179,7 +195,6 @@ app.get('/v1/site/admin/status', (_req, res) => {
 });
 
 app.post('/v1/site/admin/token', adminTokenLimit, async (req, res) => {
-  if (!ADMIN_OWNER_NICK) return res.status(503).json({ error: 'admin_not_configured' });
   const { nick, password } = req.body || {};
   const account = await verifyAdminServerPassword(nick, password);
   if (!account) return res.status(401).json({ error: 'invalid_credentials' });
@@ -208,7 +223,7 @@ app.post('/v1/site/admin/setup', adminAuthLimit, async (req, res) => {
     .run(account.id, credential.iterations, credential.salt, credential.hash);
   if (result.changes !== 1) return res.status(409).json({ error: 'admin_already_registered' });
   startAdminSession(res, account);
-  res.status(201).json({ ok: true, nick: account.display_nick });
+  res.status(201).json({ ok: true, nick: account.display_nick, role: isAdminOwner(account) ? 'owner' : adminStaff(account.id).role_key });
 });
 
 app.post('/v1/site/admin/login', adminAuthLimit, async (req, res) => {
@@ -221,12 +236,60 @@ app.post('/v1/site/admin/login', adminAuthLimit, async (req, res) => {
     return res.status(401).json({ error: 'invalid_credentials' });
   if (!consumeAdminToken(account.id, token)) return res.status(401).json({ error: 'invalid_or_expired_token' });
   startAdminSession(res, account);
-  res.json({ ok: true, nick: account.display_nick });
+  res.json({ ok: true, nick: account.display_nick, role: isAdminOwner(account) ? 'owner' : adminStaff(account.id).role_key });
 });
 
 app.get('/v1/site/admin/me', adminAuth, (req, res) => {
   const account = db.prepare('SELECT display_nick FROM accounts WHERE id=?').get(req.adminAccountId);
-  res.json({ nick: account.display_nick });
+  res.json({ nick: account.display_nick, role: req.adminRole });
+});
+
+app.get('/v1/site/admin/staff', adminAuth, requireAdminRoles('owner'), (_req, res) => {
+  const staff = db.prepare(`SELECT a.display_nick AS nick, s.role_key AS role, s.created_at AS createdAt,
+      EXISTS(SELECT 1 FROM admin_credentials c WHERE c.account_id=a.id) AS configured
+    FROM admin_staff s JOIN accounts a ON a.id=s.account_id ORDER BY lower(a.display_nick)`).all();
+  res.json({ staff });
+});
+
+app.post('/v1/site/admin/staff', adminAuth, requireAdminRoles('owner'), (req, res) => {
+  const nick = typeof req.body?.nick === 'string' ? req.body.nick.trim() : '';
+  const role = req.body?.role;
+  if (!NICK_RE.test(nick) || !['admin', 'moderator', 'helper'].includes(role))
+    return res.status(400).json({ error: 'invalid_staff' });
+  const account = getAccount(nick);
+  if (!account) return res.status(404).json({ error: 'account_not_found' });
+  if (isAdminOwner(account)) return res.status(400).json({ error: 'cannot_change_owner' });
+  if (adminStaff(account.id)) return res.status(409).json({ error: 'staff_exists' });
+  db.prepare('INSERT INTO admin_staff(account_id,role_key,created_by) VALUES(?,?,?)').run(account.id, role, req.adminAccountId);
+  audit(req.adminNick, 'admin_staff_add', `${account.display_nick}:${role}`);
+  res.status(201).json({ ok: true, nick: account.display_nick, role });
+});
+
+app.patch('/v1/site/admin/staff/:nick', adminAuth, requireAdminRoles('owner'), (req, res) => {
+  const account = getAccount(req.params.nick);
+  const role = req.body?.role;
+  if (!account) return res.status(404).json({ error: 'account_not_found' });
+  if (isAdminOwner(account)) return res.status(400).json({ error: 'cannot_change_owner' });
+  if (!['admin', 'moderator', 'helper'].includes(role)) return res.status(400).json({ error: 'invalid_staff' });
+  const changed = db.prepare('UPDATE admin_staff SET role_key=? WHERE account_id=?').run(role, account.id);
+  if (!changed.changes) return res.status(404).json({ error: 'staff_not_found' });
+  db.prepare('DELETE FROM admin_sessions WHERE account_id=?').run(account.id);
+  db.prepare('DELETE FROM admin_challenges WHERE account_id=?').run(account.id);
+  audit(req.adminNick, 'admin_staff_role', `${account.display_nick}:${role}`);
+  res.json({ ok: true, nick: account.display_nick, role });
+});
+
+app.delete('/v1/site/admin/staff/:nick', adminAuth, requireAdminRoles('owner'), (req, res) => {
+  const account = getAccount(req.params.nick);
+  if (!account) return res.status(404).json({ error: 'account_not_found' });
+  if (isAdminOwner(account)) return res.status(400).json({ error: 'cannot_change_owner' });
+  const result = db.prepare('DELETE FROM admin_staff WHERE account_id=?').run(account.id);
+  if (!result.changes) return res.status(404).json({ error: 'staff_not_found' });
+  db.prepare('DELETE FROM admin_credentials WHERE account_id=?').run(account.id);
+  db.prepare('DELETE FROM admin_challenges WHERE account_id=?').run(account.id);
+  db.prepare('DELETE FROM admin_sessions WHERE account_id=?').run(account.id);
+  audit(req.adminNick, 'admin_staff_remove', account.display_nick);
+  res.json({ ok: true });
 });
 
 app.get('/v1/site/admin/accounts', adminAuth, (req, res) => {
@@ -245,14 +308,14 @@ app.get('/v1/site/admin/roles', adminAuth, (_req, res) => {
     .map(role => ({ id: role.id, name: role.name, group: role.groupName })) });
 });
 
-app.post('/v1/site/admin/roles', adminAuth, (req, res) => {
+app.post('/v1/site/admin/roles', adminAuth, requireAdminRoles('owner'), (req, res) => {
   const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
   const group = typeof req.body?.group === 'string' ? req.body.group.trim() : '';
   if (!/^[A-Za-z0-9 _-]{2,32}$/.test(name) || !/^[A-Za-z0-9._-]{1,64}$/.test(group) || group.toLowerCase() === 'default')
     return res.status(400).json({ error: 'invalid_role' });
   try {
     const result = db.prepare('INSERT INTO admin_roles(name,lp_group) VALUES(?,?)').run(name, group);
-    audit(ADMIN_OWNER_NICK, 'admin_role_create', `${name}:${group}`);
+    audit(req.adminNick, 'admin_role_create', `${name}:${group}`);
     res.status(201).json({ role: { id: Number(result.lastInsertRowid), name, group } });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'role_exists' });
@@ -260,12 +323,12 @@ app.post('/v1/site/admin/roles', adminAuth, (req, res) => {
   }
 });
 
-app.delete('/v1/site/admin/roles/:id', adminAuth, (req, res) => {
+app.delete('/v1/site/admin/roles/:id', adminAuth, requireAdminRoles('owner'), (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ error: 'invalid_role' });
   const result = db.prepare('DELETE FROM admin_roles WHERE id=?').run(id);
   if (!result.changes) return res.status(404).json({ error: 'role_not_found' });
-  audit(ADMIN_OWNER_NICK, 'admin_role_delete', String(id));
+  audit(req.adminNick, 'admin_role_delete', String(id));
   res.json({ ok: true });
 });
 
@@ -282,6 +345,13 @@ app.post('/v1/site/admin/accounts/:nick/actions', adminAuth, (req, res) => {
   const { action } = req.body || {};
   const allowed = new Set(['ban', 'unban', 'kick', 'mute', 'unmute', 'warn', 'set_role', 'reset_password']);
   if (!allowed.has(action)) return res.status(400).json({ error: 'invalid_action' });
+  const allowedByRole = {
+    owner: allowed,
+    admin: allowed,
+    moderator: new Set(['ban', 'unban', 'kick', 'mute', 'unmute', 'warn']),
+    helper: new Set(['mute', 'unmute', 'warn']),
+  };
+  if (!allowedByRole[req.adminRole]?.has(action)) return res.status(403).json({ error: 'forbidden' });
 
   if (action === 'reset_password') {
     const password = randomBytes(18).toString('base64url');
@@ -290,7 +360,7 @@ app.post('/v1/site/admin/accounts/:nick/actions', adminAuth, (req, res) => {
         .run(credential.iterations, credential.salt, credential.hash, account.id);
       db.prepare('DELETE FROM sessions WHERE account_id=?').run(account.id);
       db.prepare('DELETE FROM admin_sessions WHERE account_id=?').run(account.id);
-      audit(ADMIN_OWNER_NICK, 'admin_password_reset', account.display_nick);
+      audit(req.adminNick, 'admin_password_reset', account.display_nick);
       res.json({ ok: true, temporaryPassword: password });
     }).catch(error => res.status(500).json({ error: 'password_reset_failed' }));
   }
@@ -313,7 +383,7 @@ app.post('/v1/site/admin/accounts/:nick/actions', adminAuth, (req, res) => {
     db.prepare(`INSERT INTO admin_mutes(account_id,actor_nick,reason,expires_at) VALUES(?,?,?,?)
       ON CONFLICT(account_id) DO UPDATE SET actor_nick=excluded.actor_nick, reason=excluded.reason,
       expires_at=excluded.expires_at, updated_at=datetime('now')`)
-      .run(account.id, ADMIN_OWNER_NICK, reason, payload.expiresAt);
+      .run(account.id, req.adminNick, reason, payload.expiresAt);
   }
   if (action === 'unmute') db.prepare('DELETE FROM admin_mutes WHERE account_id=?').run(account.id);
   if (action === 'set_role') {
@@ -325,8 +395,8 @@ app.post('/v1/site/admin/accounts/:nick/actions', adminAuth, (req, res) => {
   }
 
   const result = db.prepare('INSERT INTO admin_actions(target_account_id,actor_nick,action,payload) VALUES(?,?,?,?)')
-    .run(account.id, ADMIN_OWNER_NICK, action, JSON.stringify(payload));
-  audit(ADMIN_OWNER_NICK, `admin_${action}`, account.display_nick);
+    .run(account.id, req.adminNick, action, JSON.stringify(payload));
+  audit(req.adminNick, `admin_${action}`, account.display_nick);
   res.status(202).json({ ok: true, id: Number(result.lastInsertRowid), status: 'pending' });
 });
 
