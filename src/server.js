@@ -127,6 +127,7 @@ app.get('/v1/site/store/catalog', (_req, res) => {
 });
 
 const paymentLimit = rateLimit({ windowMs: 60000, max: 5, keyFn: (r) => `pay:${r.ip}:${r.accountId || ''}` });
+const paymentVerifyLimit = rateLimit({ windowMs: 60000, max: 8, keyFn: (r) => `pv:${r.ip}:${r.accountId || ''}:${r.params.id}` });
 function isValidCpf(value) {
   if (typeof value !== 'string' || !/^\d{11}$/.test(value) || /^([0-9])\1{10}$/.test(value)) return false;
   const checkDigit = length => {
@@ -296,6 +297,42 @@ app.get('/v1/site/store/orders/:id', siteAuth, (req, res) => {
   const order = db.prepare('SELECT id,status FROM store_orders WHERE id=? AND account_id=?').get(req.params.id, req.accountId);
   if (!order) return res.sendStatus(404);
   res.json(order);
+});
+
+app.post('/v1/site/store/orders/:id/verify', siteAuth, paymentVerifyLimit, async (req, res) => {
+  const order = db.prepare('SELECT * FROM store_orders WHERE id=? AND account_id=?').get(req.params.id, req.accountId);
+  if (!order) return res.sendStatus(404);
+  if (order.status !== 'pending') return res.json({ id: order.id, status: order.status });
+  if (!order.payment_id) return res.status(409).json({ error: 'payment_not_linked' });
+
+  const accessToken = process.env.MP_ACCESS_TOKEN;
+  if (!accessToken) return res.status(503).json({ error: 'payments_not_configured' });
+  const mpBase = (process.env.MP_API_URL || 'https://api.mercadopago.com').replace(/\/$/, '');
+  try {
+    const response = await fetch(`${mpBase}/v1/payments/${encodeURIComponent(order.payment_id)}`, {
+      headers: { Authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) return res.status(502).json({ error: 'payment_status_unavailable' });
+    const payment = await response.json();
+    if (payment.external_reference !== order.id || payment.currency_id !== 'BRL'
+      || Math.round(Number(payment.transaction_amount) * 100) !== order.amount_cents) {
+      console.error('[mercadopago] payment verification mismatch', order.id, String(payment.id || ''));
+      return res.status(409).json({ error: 'payment_verification_mismatch' });
+    }
+
+    if (payment.status === 'approved') {
+      finalizeApprovedPayment(order, payment);
+      return res.json({ id: order.id, status: 'paid' });
+    }
+    if (['rejected', 'cancelled'].includes(payment.status)) {
+      db.prepare("UPDATE store_orders SET status='failed',updated_at=datetime('now') WHERE id=? AND status='pending'").run(order.id);
+      return res.json({ id: order.id, status: 'failed' });
+    }
+    res.json({ id: order.id, status: 'pending', providerStatus: String(payment.status || 'pending') });
+  } catch (error) {
+    console.error('[mercadopago] payment status check failed', order.id, String(error?.message || error).slice(0, 160));
+    res.status(502).json({ error: 'payment_status_unavailable' });
+  }
 });
 
 function validPaymentSignature(req, paymentId) {
