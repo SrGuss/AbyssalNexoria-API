@@ -170,9 +170,7 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
   const identificationNumber = typeof payer.identification?.number === 'string'
     ? payer.identification.number.replace(/\D/g, '') : '';
   if (!/^[a-z0-9_-]{2,64}$/i.test(methodId) || email.length > 254
-    || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-    || !/^[a-z0-9_-]{1,16}$/i.test(identificationType)
-    || !/^\d{5,20}$/.test(identificationNumber))
+    || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
     return res.status(400).json({ error: 'invalid_payment_data' });
   const paymentToken = typeof form.token === 'string' ? form.token : '';
   const isCard = !!paymentToken;
@@ -218,11 +216,12 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
       payment_method_id: methodId,
       payer: {
         email,
-        identification: { type: identificationType, number: identificationNumber },
       },
       external_reference: orderId,
       notification_url: webhookUrl,
     };
+    if (/^[a-z0-9_-]{1,16}$/i.test(identificationType) && /^\d{5,20}$/.test(identificationNumber))
+      paymentRequest.payer.identification = { type: identificationType, number: identificationNumber };
     for (const key of ['first_name', 'last_name']) {
       const value = typeof payer[key] === 'string' ? payer[key].trim().slice(0, 80) : '';
       if (value) paymentRequest.payer[key] = value;
