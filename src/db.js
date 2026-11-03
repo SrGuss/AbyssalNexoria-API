@@ -62,6 +62,16 @@ CREATE TABLE IF NOT EXISTS admin_roles (
   lp_group TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS luckperms_sync (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  available INTEGER NOT NULL DEFAULT 0,
+  synced_at TEXT
+);
+INSERT OR IGNORE INTO luckperms_sync(id,available,synced_at) VALUES(1,0,NULL);
+CREATE TABLE IF NOT EXISTS luckperms_groups (
+  name TEXT PRIMARY KEY,
+  synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS admin_actions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   target_account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

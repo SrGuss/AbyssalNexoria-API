@@ -308,15 +308,47 @@ app.get('/v1/site/admin/roles', adminAuth, (_req, res) => {
     .map(role => ({ id: role.id, name: role.name, group: role.groupName })) });
 });
 
+app.get('/v1/site/admin/luckperms/groups', adminAuth, (_req, res) => {
+  const sync = db.prepare('SELECT available, synced_at AS syncedAt FROM luckperms_sync WHERE id=1').get();
+  const groups = db.prepare('SELECT name FROM luckperms_groups ORDER BY lower(name)').all().map(row => row.name);
+  res.json({ available: !!sync?.available, syncedAt: sync?.syncedAt || null, groups });
+});
+
 app.post('/v1/site/admin/roles', adminAuth, requireAdminRoles('owner'), (req, res) => {
   const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
   const group = typeof req.body?.group === 'string' ? req.body.group.trim() : '';
   if (!/^[A-Za-z0-9 _-]{2,32}$/.test(name) || !/^[A-Za-z0-9._-]{1,64}$/.test(group) || group.toLowerCase() === 'default')
     return res.status(400).json({ error: 'invalid_role' });
+  const sync = db.prepare('SELECT available FROM luckperms_sync WHERE id=1').get();
+  if (!sync?.available) return res.status(503).json({ error: 'luckperms_unavailable' });
+  if (!db.prepare('SELECT 1 FROM luckperms_groups WHERE name=?').get(group))
+    return res.status(400).json({ error: 'luckperms_group_not_found' });
   try {
     const result = db.prepare('INSERT INTO admin_roles(name,lp_group) VALUES(?,?)').run(name, group);
     audit(req.adminNick, 'admin_role_create', `${name}:${group}`);
     res.status(201).json({ role: { id: Number(result.lastInsertRowid), name, group } });
+  } catch (error) {
+    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'role_exists' });
+    throw error;
+  }
+});
+
+app.patch('/v1/site/admin/roles/:id', adminAuth, requireAdminRoles('owner'), (req, res) => {
+  const id = Number(req.params.id);
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  const group = typeof req.body?.group === 'string' ? req.body.group.trim() : '';
+  if (!Number.isSafeInteger(id) || id < 1 || !/^[A-Za-z0-9 _-]{2,32}$/.test(name)
+    || !/^[A-Za-z0-9._-]{1,64}$/.test(group) || group.toLowerCase() === 'default')
+    return res.status(400).json({ error: 'invalid_role' });
+  const sync = db.prepare('SELECT available FROM luckperms_sync WHERE id=1').get();
+  if (!sync?.available) return res.status(503).json({ error: 'luckperms_unavailable' });
+  if (!db.prepare('SELECT 1 FROM luckperms_groups WHERE name=?').get(group))
+    return res.status(400).json({ error: 'luckperms_group_not_found' });
+  try {
+    const result = db.prepare('UPDATE admin_roles SET name=?,lp_group=? WHERE id=?').run(name, group, id);
+    if (!result.changes) return res.status(404).json({ error: 'role_not_found' });
+    audit(req.adminNick, 'admin_role_update', `${name}:${group}`);
+    res.json({ ok: true, role: { id, name, group } });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'role_exists' });
     throw error;
@@ -389,6 +421,10 @@ app.post('/v1/site/admin/accounts/:nick/actions', adminAuth, (req, res) => {
   if (action === 'set_role') {
     const role = db.prepare('SELECT id,name,lp_group AS groupName FROM admin_roles WHERE id=?').get(Number(req.body?.roleId));
     if (!role) return res.status(400).json({ error: 'invalid_role' });
+    const luckperms = db.prepare('SELECT available FROM luckperms_sync WHERE id=1').get();
+    if (!luckperms?.available) return res.status(503).json({ error: 'luckperms_unavailable' });
+    if (!db.prepare('SELECT 1 FROM luckperms_groups WHERE name=?').get(role.groupName))
+      return res.status(409).json({ error: 'luckperms_group_not_found' });
     payload.roleName = role.name;
     payload.roleGroup = role.groupName;
     payload.mappedGroups = db.prepare('SELECT lp_group FROM admin_roles').all().map(row => row.lp_group);
@@ -444,6 +480,28 @@ app.get('/v1/bridge/admin/mutes', bridgeKey, (_req, res) => {
   const mutes = db.prepare(`SELECT a.display_nick AS nick, a.uuid, m.reason, m.expires_at AS expiresAt
     FROM admin_mutes m JOIN accounts a ON a.id=m.account_id WHERE m.expires_at>?`).all(Date.now());
   res.json({ mutes });
+});
+app.put('/v1/bridge/luckperms/groups', bridgeKey, (req, res) => {
+  const { available, groups } = req.body || {};
+  if (typeof available !== 'boolean' || !Array.isArray(groups) || groups.length > 1000
+    || groups.some(group => typeof group !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(group)))
+    return res.status(400).json({ error: 'invalid_luckperms_groups' });
+  const unique = [...new Set(groups)];
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('DELETE FROM luckperms_groups').run();
+    if (available) {
+      const insert = db.prepare('INSERT INTO luckperms_groups(name,synced_at) VALUES(?,datetime(\'now\'))');
+      for (const group of unique) insert.run(group);
+    }
+    db.prepare('UPDATE luckperms_sync SET available=?,synced_at=datetime(\'now\') WHERE id=1')
+      .run(available ? 1 : 0);
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  res.json({ ok: true, available, count: available ? unique.length : 0 });
 });
 
 // ---------- Plugin de VIP (chave VIP_KEY): fila de comandos ----------
