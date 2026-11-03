@@ -127,6 +127,17 @@ app.get('/v1/site/store/catalog', (_req, res) => {
 });
 
 const paymentLimit = rateLimit({ windowMs: 60000, max: 5, keyFn: (r) => `pay:${r.ip}:${r.accountId || ''}` });
+function isValidCpf(value) {
+  if (typeof value !== 'string' || !/^\d{11}$/.test(value) || /^([0-9])\1{10}$/.test(value)) return false;
+  const checkDigit = length => {
+    let sum = 0;
+    for (let index = 0; index < length; index++) sum += Number(value[index]) * (length + 1 - index);
+    const remainder = (sum * 10) % 11;
+    return remainder === 10 ? 0 : remainder;
+  };
+  return checkDigit(9) === Number(value[9]) && checkDigit(10) === Number(value[10]);
+}
+
 function finalizeApprovedPayment(order, payment) {
   const items = db.prepare('SELECT * FROM store_order_items WHERE order_id=?').all(order.id);
   db.exec('BEGIN IMMEDIATE');
@@ -174,8 +185,8 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
   if (!/^[a-z0-9_-]{2,64}$/i.test(methodId) || email.length > 254
     || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
     return res.status(400).json({ error: 'invalid_payment_data' });
-  if (methodId === 'pix' && !validIdentification)
-    return res.status(400).json({ error: 'pix_identification_required' });
+  if (methodId === 'pix' && (identificationType.toUpperCase() !== 'CPF' || !isValidCpf(identificationNumber)))
+    return res.status(400).json({ error: 'pix_cpf_invalid' });
   const paymentToken = typeof form.token === 'string' ? form.token : '';
   const isCard = !!paymentToken;
   if ((isCard && (paymentToken.length > 2048 || !Number.isSafeInteger(Number(form.installments))
