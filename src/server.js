@@ -239,6 +239,11 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.id || !data.status) {
+      const causes = Array.isArray(data.cause) ? data.cause.map(cause => ({
+        code: String(cause?.code || '').slice(0, 80),
+        description: String(cause?.description || '').slice(0, 160),
+      })) : [];
+      console.error('[mercadopago] payment request rejected', response.status, JSON.stringify({ message: data.message, causes }));
       db.prepare("UPDATE store_orders SET status='failed',updated_at=datetime('now') WHERE id=? AND status='pending'").run(orderId);
       return res.status(402).json({ error: 'payment_rejected' });
     }
@@ -258,7 +263,8 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
       pixQrCodeBase64: data.point_of_interaction?.transaction_data?.qr_code_base64 || null,
       ticketUrl: data.transaction_details?.external_resource_url || null,
     });
-  } catch {
+  } catch (error) {
+    console.error('[mercadopago] payment request failed', String(error?.message || error).slice(0, 200));
     db.prepare("UPDATE store_orders SET status='failed',updated_at=datetime('now') WHERE id=? AND status='pending'").run(orderId);
     res.status(502).json({ error: 'checkout_unavailable' });
   }
