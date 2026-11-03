@@ -112,6 +112,48 @@ CREATE TABLE IF NOT EXISTS audit (
   actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS store_categories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS store_products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  category_id INTEGER NOT NULL REFERENCES store_categories(id) ON DELETE RESTRICT,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  price_cents INTEGER NOT NULL CHECK(price_cents > 0),
+  kind TEXT NOT NULL CHECK(kind IN ('vip','product')),
+  vip_group TEXT,
+  duration_days INTEGER,
+  product_code TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS store_products_active ON store_products(active, category_id);
+CREATE TABLE IF NOT EXISTS store_orders (
+  id TEXT PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid','failed')),
+  amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+  preference_id TEXT,
+  payment_id TEXT UNIQUE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS store_order_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id TEXT NOT NULL REFERENCES store_orders(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  vip_group TEXT,
+  duration_days INTEGER,
+  product_code TEXT,
+  price_cents INTEGER NOT NULL,
+  quantity INTEGER NOT NULL CHECK(quantity > 0)
+);
 `);
 export const audit = (actor, action, detail = '') =>
   db.prepare('INSERT INTO audit(actor,action,detail) VALUES(?,?,?)').run(actor, action, String(detail));

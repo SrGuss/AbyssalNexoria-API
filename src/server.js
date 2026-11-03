@@ -1,5 +1,5 @@
 import express from 'express';
-import { randomBytes, randomInt } from 'node:crypto';
+import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { db, audit } from './db.js';
 import {
   hashPassword, verifyPassword, dummyVerify, TARGET_ITERATIONS, sha256, safeEqualStr, newToken,
@@ -112,6 +112,150 @@ app.get('/v1/site/me', siteAuth, (req, res) => {
   const a = db.prepare('SELECT id,display_nick FROM accounts WHERE id=?').get(req.accountId);
   const p = db.prepare('SELECT data,updated_at FROM profiles WHERE account_id=?').get(req.accountId);
   res.json({ nick: a.display_nick, profile: p ? JSON.parse(p.data) : null, updatedAt: p?.updated_at || null });
+});
+
+// ---------- Loja ----------
+const storeProductsQuery = `SELECT p.id,p.category_id AS categoryId,c.name AS category,p.name,p.description,
+    p.price_cents AS priceCents,p.kind,p.vip_group AS vipGroup,p.duration_days AS durationDays,
+    p.product_code AS productCode,p.active
+  FROM store_products p JOIN store_categories c ON c.id=p.category_id`;
+
+app.get('/v1/site/store/catalog', (_req, res) => {
+  const products = db.prepare(`${storeProductsQuery} WHERE p.active=1 ORDER BY c.name,p.name`).all();
+  const categories = [...new Map(products.map(product => [product.categoryId, { id: product.categoryId, name: product.category }])).values()];
+  res.json({ categories, products });
+});
+
+const paymentLimit = rateLimit({ windowMs: 60000, max: 5, keyFn: (r) => `pay:${r.ip}:${r.accountId || ''}` });
+app.post('/v1/site/store/orders', siteAuth, paymentLimit, async (req, res) => {
+  const accessToken = process.env.MP_ACCESS_TOKEN;
+  const webhookSecret = process.env.MP_WEBHOOK_SECRET;
+  const webhookUrl = process.env.MP_WEBHOOK_URL;
+  const siteUrl = (process.env.SITE_URL || '').replace(/\/$/, '');
+  if (!accessToken || !webhookSecret || !webhookUrl || !siteUrl)
+    return res.status(503).json({ error: 'payments_not_configured' });
+
+  const requested = req.body?.items;
+  if (!Array.isArray(requested) || requested.length < 1 || requested.length > 20)
+    return res.status(400).json({ error: 'invalid_cart' });
+  const quantities = new Map();
+  for (const item of requested) {
+    const id = Number(item?.id), quantity = Number(item?.quantity);
+    if (!Number.isSafeInteger(id) || id < 1 || !Number.isSafeInteger(quantity) || quantity < 1 || quantity > 99)
+      return res.status(400).json({ error: 'invalid_cart' });
+    quantities.set(id, (quantities.get(id) || 0) + quantity);
+  }
+  if ([...quantities.values()].some(quantity => quantity > 99)) return res.status(400).json({ error: 'invalid_cart' });
+
+  const ids = [...quantities.keys()];
+  const products = db.prepare(`${storeProductsQuery} WHERE p.active=1 AND p.id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+  if (products.length !== ids.length) return res.status(400).json({ error: 'products_unavailable' });
+  const amountCents = products.reduce((sum, product) => sum + product.priceCents * quantities.get(product.id), 0);
+  if (!Number.isSafeInteger(amountCents) || amountCents < 100) return res.status(400).json({ error: 'invalid_total' });
+
+  const orderId = randomUUID();
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('INSERT INTO store_orders(id,account_id,amount_cents) VALUES(?,?,?)').run(orderId, req.accountId, amountCents);
+    const insertItem = db.prepare(`INSERT INTO store_order_items(order_id,product_id,name,kind,vip_group,duration_days,product_code,price_cents,quantity)
+      VALUES(?,?,?,?,?,?,?,?,?)`);
+    for (const product of products) insertItem.run(orderId, product.id, product.name, product.kind, product.vipGroup,
+      product.durationDays, product.productCode, product.priceCents, quantities.get(product.id));
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+
+  const preference = {
+    external_reference: orderId,
+    notification_url: webhookUrl,
+    back_urls: {
+      success: `${siteUrl}/?payment=success`,
+      pending: `${siteUrl}/?payment=pending`,
+      failure: `${siteUrl}/?payment=failure`,
+    },
+    auto_return: 'approved',
+    items: products.map(product => ({
+      id: String(product.id), title: product.name, description: product.description.slice(0, 250),
+      quantity: quantities.get(product.id), currency_id: 'BRL', unit_price: product.priceCents / 100,
+    })),
+  };
+  const mpBase = (process.env.MP_API_URL || 'https://api.mercadopago.com').replace(/\/$/, '');
+  try {
+    const response = await fetch(`${mpBase}/checkout/preferences`, {
+      method: 'POST', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'X-Idempotency-Key': orderId },
+      body: JSON.stringify(preference), signal: AbortSignal.timeout(10000),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.id || !data.init_point) throw new Error('preference_failed');
+    db.prepare("UPDATE store_orders SET preference_id=?,updated_at=datetime('now') WHERE id=?")
+      .run(data.id, orderId);
+    res.status(201).json({ orderId, checkoutUrl: data.init_point });
+  } catch {
+    db.prepare("UPDATE store_orders SET status='failed',updated_at=datetime('now') WHERE id=? AND status='pending'").run(orderId);
+    res.status(502).json({ error: 'checkout_unavailable' });
+  }
+});
+
+function validPaymentSignature(req, paymentId) {
+  const signature = req.get('x-signature') || '';
+  const requestId = req.get('x-request-id') || '';
+  const parts = Object.fromEntries(signature.split(',').map(part => part.trim().split('=')));
+  if (!parts.ts || !parts.v1 || !paymentId) return false;
+  const manifest = `id:${String(paymentId).toLowerCase()};request-id:${requestId};ts:${parts.ts};`;
+  const expected = createHmac('sha256', process.env.MP_WEBHOOK_SECRET).update(manifest).digest();
+  let received;
+  try { received = Buffer.from(parts.v1, 'hex'); } catch { return false; }
+  return received.length === expected.length && timingSafeEqual(received, expected);
+}
+
+app.post('/v1/site/payments/webhook', async (req, res) => {
+  const paymentId = req.query['data.id'] || req.body?.data?.id;
+  if (!process.env.MP_ACCESS_TOKEN || !process.env.MP_WEBHOOK_SECRET) return res.sendStatus(503);
+  if (!validPaymentSignature(req, paymentId)) return res.sendStatus(401);
+  if (req.body?.type !== 'payment' && !String(req.body?.action || '').startsWith('payment.')) return res.sendStatus(200);
+
+  const mpBase = (process.env.MP_API_URL || 'https://api.mercadopago.com').replace(/\/$/, '');
+  try {
+    const response = await fetch(`${mpBase}/v1/payments/${encodeURIComponent(paymentId)}`, {
+      headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` }, signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) return res.sendStatus(502);
+    const payment = await response.json();
+    if (payment.status !== 'approved') return res.sendStatus(200);
+    const orderId = payment.external_reference;
+    const order = db.prepare('SELECT * FROM store_orders WHERE id=?').get(orderId);
+    if (!order || payment.currency_id !== 'BRL' || Math.round(Number(payment.transaction_amount) * 100) !== order.amount_cents)
+      return res.sendStatus(200);
+    if (order.status === 'paid') return res.sendStatus(200);
+
+    const items = db.prepare('SELECT * FROM store_order_items WHERE order_id=?').all(orderId);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const updated = db.prepare(`UPDATE store_orders SET status='paid',payment_id=?,updated_at=datetime('now')
+        WHERE id=? AND status='pending'`).run(String(payment.id), orderId);
+      if (updated.changes) {
+        const command = db.prepare('INSERT OR IGNORE INTO commands(event_id,account_id,type,payload) VALUES(?,?,?,?)');
+        for (const item of items) {
+          const type = item.kind === 'vip' ? 'GRANT_VIP' : 'STORE_PRODUCT';
+          const payload = JSON.stringify({
+            orderId, productId: item.product_id, productName: item.name, quantity: item.quantity,
+            group: item.vip_group, durationDays: item.duration_days, productCode: item.product_code,
+          });
+          command.run(`mp:${payment.id}:${item.id}`, order.account_id, type, payload);
+        }
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+    if (order.status !== 'paid') audit('mercadopago', 'store_payment_approved', orderId);
+    res.sendStatus(200);
+  } catch {
+    res.sendStatus(502);
+  }
 });
 // pede dado fresco: a API so registra o pedido, o Bridge busca
 app.post('/v1/site/refresh', siteAuth, rateLimit({ windowMs: 30000, max: 3, keyFn: (r) => `rf:${r.ip}` }), (req, res) => {
@@ -242,6 +386,99 @@ app.post('/v1/site/admin/login', adminAuthLimit, async (req, res) => {
 app.get('/v1/site/admin/me', adminAuth, (req, res) => {
   const account = db.prepare('SELECT display_nick FROM accounts WHERE id=?').get(req.adminAccountId);
   res.json({ nick: account.display_nick, role: req.adminRole });
+});
+
+const manageStore = requireAdminRoles('owner', 'admin');
+app.get('/v1/site/admin/store', adminAuth, manageStore, (_req, res) => {
+  const categories = db.prepare('SELECT id,name FROM store_categories ORDER BY name').all();
+  const products = db.prepare(`${storeProductsQuery} ORDER BY c.name,p.name`).all();
+  res.json({ categories, products });
+});
+
+app.post('/v1/site/admin/store/categories', adminAuth, manageStore, (req, res) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  if (name.length < 2 || name.length > 40) return res.status(400).json({ error: 'invalid_category' });
+  try {
+    const result = db.prepare('INSERT INTO store_categories(name) VALUES(?)').run(name);
+    audit(req.adminNick, 'store_category_created', name);
+    res.status(201).json({ id: Number(result.lastInsertRowid), name });
+  } catch { res.status(409).json({ error: 'category_exists' }); }
+});
+
+app.patch('/v1/site/admin/store/categories/:id', adminAuth, manageStore, (req, res) => {
+  const id = Number(req.params.id), name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  if (!Number.isSafeInteger(id) || id < 1 || name.length < 2 || name.length > 40)
+    return res.status(400).json({ error: 'invalid_category' });
+  try {
+    const result = db.prepare('UPDATE store_categories SET name=? WHERE id=?').run(name, id);
+    if (!result.changes) return res.sendStatus(404);
+    audit(req.adminNick, 'store_category_updated', name);
+    res.json({ id, name });
+  } catch { res.status(409).json({ error: 'category_exists' }); }
+});
+
+app.delete('/v1/site/admin/store/categories/:id', adminAuth, manageStore, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ error: 'invalid_category' });
+  if (db.prepare('SELECT 1 FROM store_products WHERE category_id=? LIMIT 1').get(id))
+    return res.status(409).json({ error: 'category_not_empty' });
+  const result = db.prepare('DELETE FROM store_categories WHERE id=?').run(id);
+  if (!result.changes) return res.sendStatus(404);
+  audit(req.adminNick, 'store_category_deleted', String(id));
+  res.json({ ok: true });
+});
+
+function storeProductInput(body) {
+  const name = typeof body?.name === 'string' ? body.name.trim() : '';
+  const description = typeof body?.description === 'string' ? body.description.trim() : '';
+  const categoryId = Number(body?.categoryId);
+  const price = typeof body?.price === 'string' || typeof body?.price === 'number' ? String(body.price).trim() : '';
+  const kind = body?.kind;
+  const vipGroup = typeof body?.vipGroup === 'string' ? body.vipGroup.trim() : '';
+  const productCode = typeof body?.productCode === 'string' ? body.productCode.trim() : '';
+  const durationDays = body?.durationDays === '' || body?.durationDays == null ? null : Number(body.durationDays);
+  if (name.length < 2 || name.length > 80 || description.length > 1000
+    || !Number.isSafeInteger(categoryId) || categoryId < 1 || !/^\d{1,7}(\.\d{1,2})?$/.test(price)
+    || !['vip', 'product'].includes(kind)) return null;
+  const priceCents = Math.round(Number(price) * 100);
+  if (!Number.isSafeInteger(priceCents) || priceCents < 100 || priceCents > 100000000) return null;
+  if (kind === 'vip' && !/^[A-Za-z0-9._-]{1,64}$/.test(vipGroup)) return null;
+  if (kind === 'product' && !/^[A-Za-z0-9._-]{1,64}$/.test(productCode)) return null;
+  if (durationDays != null && (!Number.isSafeInteger(durationDays) || durationDays < 1 || durationDays > 3650)) return null;
+  if (!db.prepare('SELECT 1 FROM store_categories WHERE id=?').get(categoryId)) return null;
+  return { name, description, categoryId, priceCents, kind, vipGroup: kind === 'vip' ? vipGroup : null,
+    durationDays: kind === 'vip' ? durationDays : null, productCode: kind === 'product' ? productCode : null,
+    active: body.active === false || body.active === 0 ? 0 : 1 };
+}
+
+app.post('/v1/site/admin/store/products', adminAuth, manageStore, (req, res) => {
+  const product = storeProductInput(req.body);
+  if (!product) return res.status(400).json({ error: 'invalid_product' });
+  const result = db.prepare(`INSERT INTO store_products(category_id,name,description,price_cents,kind,vip_group,duration_days,product_code,active)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run(product.categoryId, product.name, product.description, product.priceCents,
+    product.kind, product.vipGroup, product.durationDays, product.productCode, product.active);
+  audit(req.adminNick, 'store_product_created', product.name);
+  res.status(201).json({ id: Number(result.lastInsertRowid) });
+});
+
+app.patch('/v1/site/admin/store/products/:id', adminAuth, manageStore, (req, res) => {
+  const id = Number(req.params.id), product = storeProductInput(req.body);
+  if (!Number.isSafeInteger(id) || id < 1 || !product) return res.status(400).json({ error: 'invalid_product' });
+  const result = db.prepare(`UPDATE store_products SET category_id=?,name=?,description=?,price_cents=?,kind=?,vip_group=?,duration_days=?,product_code=?,active=?,updated_at=datetime('now')
+    WHERE id=?`).run(product.categoryId, product.name, product.description, product.priceCents,
+    product.kind, product.vipGroup, product.durationDays, product.productCode, product.active, id);
+  if (!result.changes) return res.sendStatus(404);
+  audit(req.adminNick, 'store_product_updated', product.name);
+  res.json({ ok: true });
+});
+
+app.delete('/v1/site/admin/store/products/:id', adminAuth, manageStore, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ error: 'invalid_product' });
+  const result = db.prepare("UPDATE store_products SET active=0,updated_at=datetime('now') WHERE id=?").run(id);
+  if (!result.changes) return res.sendStatus(404);
+  audit(req.adminNick, 'store_product_disabled', String(id));
+  res.json({ ok: true });
 });
 
 app.get('/v1/site/admin/staff', adminAuth, requireAdminRoles('owner'), (_req, res) => {
