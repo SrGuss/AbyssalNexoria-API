@@ -1,5 +1,5 @@
 import express from 'express';
-import { randomInt } from 'node:crypto';
+import { randomBytes, randomInt } from 'node:crypto';
 import { db, audit } from './db.js';
 import {
   hashPassword, verifyPassword, dummyVerify, TARGET_ITERATIONS, sha256, safeEqualStr, newToken,
@@ -229,6 +229,107 @@ app.get('/v1/site/admin/me', adminAuth, (req, res) => {
   res.json({ nick: account.display_nick });
 });
 
+app.get('/v1/site/admin/accounts', adminAuth, (req, res) => {
+  const search = String(req.query.search || '').trim().slice(0, 32);
+  const pattern = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
+  const rows = db.prepare(`SELECT a.id, a.display_nick AS nick, a.uuid, a.created_at AS createdAt,
+      p.data AS profile, p.updated_at AS updatedAt
+    FROM accounts a LEFT JOIN profiles p ON p.account_id=a.id
+    WHERE ?='' OR a.nick LIKE ? ESCAPE '\\' OR a.display_nick LIKE ? ESCAPE '\\'
+    ORDER BY lower(a.display_nick) LIMIT 100`).all(search, pattern, pattern);
+  res.json({ accounts: rows.map(row => ({ ...row, profile: row.profile ? JSON.parse(row.profile) : null })) });
+});
+
+app.get('/v1/site/admin/roles', adminAuth, (_req, res) => {
+  res.json({ roles: db.prepare('SELECT id,name,lp_group AS groupName FROM admin_roles ORDER BY name').all()
+    .map(role => ({ id: role.id, name: role.name, group: role.groupName })) });
+});
+
+app.post('/v1/site/admin/roles', adminAuth, (req, res) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  const group = typeof req.body?.group === 'string' ? req.body.group.trim() : '';
+  if (!/^[A-Za-z0-9 _-]{2,32}$/.test(name) || !/^[A-Za-z0-9._-]{1,64}$/.test(group) || group.toLowerCase() === 'default')
+    return res.status(400).json({ error: 'invalid_role' });
+  try {
+    const result = db.prepare('INSERT INTO admin_roles(name,lp_group) VALUES(?,?)').run(name, group);
+    audit(ADMIN_OWNER_NICK, 'admin_role_create', `${name}:${group}`);
+    res.status(201).json({ role: { id: Number(result.lastInsertRowid), name, group } });
+  } catch (error) {
+    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'role_exists' });
+    throw error;
+  }
+});
+
+app.delete('/v1/site/admin/roles/:id', adminAuth, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ error: 'invalid_role' });
+  const result = db.prepare('DELETE FROM admin_roles WHERE id=?').run(id);
+  if (!result.changes) return res.status(404).json({ error: 'role_not_found' });
+  audit(ADMIN_OWNER_NICK, 'admin_role_delete', String(id));
+  res.json({ ok: true });
+});
+
+app.get('/v1/site/admin/actions', adminAuth, (_req, res) => {
+  const actions = db.prepare(`SELECT x.id, a.display_nick AS nick, x.actor_nick AS actor, x.action,
+      x.status, x.result, x.created_at AS createdAt, x.completed_at AS completedAt
+    FROM admin_actions x JOIN accounts a ON a.id=x.target_account_id ORDER BY x.id DESC LIMIT 100`).all();
+  res.json({ actions });
+});
+
+app.post('/v1/site/admin/accounts/:nick/actions', adminAuth, (req, res) => {
+  const account = getAccount(req.params.nick);
+  if (!account) return res.status(404).json({ error: 'account_not_found' });
+  const { action } = req.body || {};
+  const allowed = new Set(['ban', 'unban', 'kick', 'mute', 'unmute', 'warn', 'set_role', 'reset_password']);
+  if (!allowed.has(action)) return res.status(400).json({ error: 'invalid_action' });
+
+  if (action === 'reset_password') {
+    const password = randomBytes(18).toString('base64url');
+    return hashPassword(password).then(credential => {
+      db.prepare('UPDATE accounts SET pw_iterations=?,pw_salt=?,pw_hash=? WHERE id=?')
+        .run(credential.iterations, credential.salt, credential.hash, account.id);
+      db.prepare('DELETE FROM sessions WHERE account_id=?').run(account.id);
+      db.prepare('DELETE FROM admin_sessions WHERE account_id=?').run(account.id);
+      audit(ADMIN_OWNER_NICK, 'admin_password_reset', account.display_nick);
+      res.json({ ok: true, temporaryPassword: password });
+    }).catch(error => res.status(500).json({ error: 'password_reset_failed' }));
+  }
+
+  const payload = {};
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+  if (['ban', 'kick', 'mute', 'warn'].includes(action) && (!reason || reason.length > 200))
+    return res.status(400).json({ error: 'invalid_reason' });
+  if (['ban', 'kick', 'mute', 'warn'].includes(action)) payload.reason = reason;
+
+  if (action === 'ban' && req.body?.days !== '' && req.body?.days != null) {
+    const days = Number(req.body.days);
+    if (!Number.isInteger(days) || days < 1 || days > 3650) return res.status(400).json({ error: 'invalid_duration' });
+    payload.expiresAt = Date.now() + days * 86400000;
+  }
+  if (action === 'mute') {
+    const minutes = Number(req.body?.minutes);
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 525600) return res.status(400).json({ error: 'invalid_duration' });
+    payload.expiresAt = Date.now() + minutes * 60000;
+    db.prepare(`INSERT INTO admin_mutes(account_id,actor_nick,reason,expires_at) VALUES(?,?,?,?)
+      ON CONFLICT(account_id) DO UPDATE SET actor_nick=excluded.actor_nick, reason=excluded.reason,
+      expires_at=excluded.expires_at, updated_at=datetime('now')`)
+      .run(account.id, ADMIN_OWNER_NICK, reason, payload.expiresAt);
+  }
+  if (action === 'unmute') db.prepare('DELETE FROM admin_mutes WHERE account_id=?').run(account.id);
+  if (action === 'set_role') {
+    const role = db.prepare('SELECT id,name,lp_group AS groupName FROM admin_roles WHERE id=?').get(Number(req.body?.roleId));
+    if (!role) return res.status(400).json({ error: 'invalid_role' });
+    payload.roleName = role.name;
+    payload.roleGroup = role.groupName;
+    payload.mappedGroups = db.prepare('SELECT lp_group FROM admin_roles').all().map(row => row.lp_group);
+  }
+
+  const result = db.prepare('INSERT INTO admin_actions(target_account_id,actor_nick,action,payload) VALUES(?,?,?,?)')
+    .run(account.id, ADMIN_OWNER_NICK, action, JSON.stringify(payload));
+  audit(ADMIN_OWNER_NICK, `admin_${action}`, account.display_nick);
+  res.status(202).json({ ok: true, id: Number(result.lastInsertRowid), status: 'pending' });
+});
+
 app.post('/v1/site/admin/logout', (req, res) => {
   const token = readAdminCookie(req);
   if (token) db.prepare('DELETE FROM admin_sessions WHERE token_hash=?').run(sha256(token));
@@ -253,6 +354,26 @@ app.get('/v1/bridge/refresh-requests', bridgeKey, (_req, res) => {
 app.post('/v1/bridge/refresh-requests/:id/done', bridgeKey, (req, res) => {
   db.prepare("UPDATE refresh_requests SET status='done' WHERE id=?").run(req.params.id);
   res.json({ ok: true });
+});
+app.get('/v1/bridge/admin/actions', bridgeKey, (_req, res) => {
+  const actions = db.prepare(`SELECT x.id, a.display_nick AS nick, a.uuid, x.action,
+      x.payload, x.status FROM admin_actions x JOIN accounts a ON a.id=x.target_account_id
+    WHERE x.status='pending' ORDER BY x.id LIMIT 50`).all();
+  res.json({ actions: actions.map(row => ({ ...row, payload: JSON.parse(row.payload) })) });
+});
+app.post('/v1/bridge/admin/actions/:id/result', bridgeKey, (req, res) => {
+  const { status, result } = req.body || {};
+  if (!['done', 'error'].includes(status) || typeof result !== 'string' || result.length > 200)
+    return res.status(400).json({ error: 'invalid_result' });
+  const update = db.prepare(`UPDATE admin_actions SET status=?, result=?, completed_at=datetime('now')
+    WHERE id=? AND status='pending'`).run(status, result, req.params.id);
+  res.json({ ok: true, updated: update.changes === 1 });
+});
+app.get('/v1/bridge/admin/mutes', bridgeKey, (_req, res) => {
+  db.prepare('DELETE FROM admin_mutes WHERE expires_at<=?').run(Date.now());
+  const mutes = db.prepare(`SELECT a.display_nick AS nick, a.uuid, m.reason, m.expires_at AS expiresAt
+    FROM admin_mutes m JOIN accounts a ON a.id=m.account_id WHERE m.expires_at>?`).all(Date.now());
+  res.json({ mutes });
 });
 
 // ---------- Plugin de VIP (chave VIP_KEY): fila de comandos ----------
