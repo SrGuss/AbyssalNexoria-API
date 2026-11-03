@@ -1,7 +1,8 @@
 import express from 'express';
+import { randomInt } from 'node:crypto';
 import { db, audit } from './db.js';
 import {
-  hashPassword, verifyPassword, dummyVerify, TARGET_ITERATIONS, sha256, newToken,
+  hashPassword, verifyPassword, dummyVerify, TARGET_ITERATIONS, sha256, safeEqualStr, newToken,
   requireKey, rateLimit, NICK_RE, normNick
 } from './security.js';
 
@@ -23,9 +24,12 @@ app.use((req, res, next) => {
 const ip = (req) => req.ip;
 const loginLimit = rateLimit({ windowMs: 15 * 60000, max: 10, keyFn: (r) => `l:${ip(r)}:${normNick(r.body?.nick)}` });
 const ipLimit = rateLimit({ windowMs: 60000, max: 60, keyFn: (r) => `i:${ip(r)}` });
+const adminTokenLimit = rateLimit({ windowMs: 15 * 60000, max: 5, keyFn: (r) => `at:${ip(r)}:${normNick(r.body?.nick)}` });
+const adminAuthLimit = rateLimit({ windowMs: 15 * 60000, max: 10, keyFn: (r) => `aa:${ip(r)}:${normNick(r.body?.nick)}` });
 
 const getAccount = (nick) => db.prepare('SELECT * FROM accounts WHERE nick = ?').get(normNick(nick));
 const rec = (a) => ({ iterations: a.pw_iterations, salt: a.pw_salt, hash: a.pw_hash });
+const ADMIN_OWNER_NICK = normNick(process.env.ADMIN_OWNER_NICK || '');
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
@@ -65,6 +69,7 @@ app.post('/v1/auth/change-password', loginKey, loginLimit, async (req, res) => {
   const p = await hashPassword(newPassword);
   db.prepare('UPDATE accounts SET pw_iterations=?,pw_salt=?,pw_hash=? WHERE id=?').run(p.iterations, p.salt, p.hash, a.id);
   db.prepare('DELETE FROM sessions WHERE account_id=?').run(a.id); // derruba sessoes do site
+  db.prepare('DELETE FROM admin_sessions WHERE account_id=?').run(a.id);
   audit('login-plugin', 'change_password', a.display_nick);
   res.json({ ok: true });
 });
@@ -112,6 +117,122 @@ app.get('/v1/site/me', siteAuth, (req, res) => {
 app.post('/v1/site/refresh', siteAuth, rateLimit({ windowMs: 30000, max: 3, keyFn: (r) => `rf:${r.ip}` }), (req, res) => {
   db.prepare("INSERT INTO refresh_requests(account_id) VALUES(?)").run(req.accountId);
   res.status(202).json({ ok: true });
+});
+
+// ---------- Admin do site (senha independente + token de uso unico) ----------
+const adminCookieOpts = `HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${HOURS * 3600}`;
+const readAdminCookie = (req) => (req.get('cookie') || '').split(';').map(s => s.trim()).find(s => s.startsWith('admin_sid='))?.slice(10);
+const getAdminCredential = (accountId) => db.prepare('SELECT * FROM admin_credentials WHERE account_id=?').get(accountId);
+
+function adminOwner(nick) {
+  if (!ADMIN_OWNER_NICK || !NICK_RE.test(nick || '') || normNick(nick) !== ADMIN_OWNER_NICK) return null;
+  return getAccount(nick);
+}
+
+async function verifyAdminServerPassword(nick, password) {
+  const account = adminOwner(nick);
+  const value = typeof password === 'string' ? password : '';
+  if (!account) { await dummyVerify(value); return null; }
+  if (value.length > 128) { await dummyVerify(value); return null; }
+  if (!(await verifyPassword(value, rec(account)))) return null;
+  await upgradeHash(account, value);
+  return account;
+}
+
+function consumeAdminToken(accountId, token) {
+  const challenge = db.prepare('SELECT * FROM admin_challenges WHERE account_id=?').get(accountId);
+  if (!challenge || challenge.expires_at < Date.now() || challenge.attempts >= 5) {
+    db.prepare('DELETE FROM admin_challenges WHERE account_id=?').run(accountId);
+    return false;
+  }
+  if (typeof token !== 'string' || !safeEqualStr(sha256(token), challenge.token_hash)) {
+    db.prepare('UPDATE admin_challenges SET attempts=attempts+1 WHERE account_id=? AND token_hash=?')
+      .run(accountId, challenge.token_hash);
+    return false;
+  }
+  return db.prepare('DELETE FROM admin_challenges WHERE account_id=? AND token_hash=? AND expires_at>=? AND attempts<5')
+    .run(accountId, challenge.token_hash, Date.now()).changes === 1;
+}
+
+function startAdminSession(res, account) {
+  const token = newToken();
+  db.prepare('INSERT INTO admin_sessions(token_hash,account_id,expires_at) VALUES(?,?,?)')
+    .run(sha256(token), account.id, Date.now() + HOURS * 3600000);
+  res.set('Set-Cookie', `admin_sid=${token}; ${adminCookieOpts}`);
+  audit(account.display_nick, 'admin_login', 'site');
+}
+
+function adminAuth(req, res, next) {
+  const token = readAdminCookie(req);
+  const session = token && db.prepare('SELECT * FROM admin_sessions WHERE token_hash=?').get(sha256(token));
+  if (!session || session.expires_at < Date.now()) {
+    if (token) db.prepare('DELETE FROM admin_sessions WHERE token_hash=?').run(sha256(token));
+    return res.status(401).json({ error: 'unauthenticated' });
+  }
+  req.adminAccountId = session.account_id;
+  next();
+}
+
+app.get('/v1/site/admin/status', (_req, res) => {
+  const account = ADMIN_OWNER_NICK ? getAccount(ADMIN_OWNER_NICK) : null;
+  res.json({ configured: !!(account && getAdminCredential(account.id)) });
+});
+
+app.post('/v1/site/admin/token', adminTokenLimit, async (req, res) => {
+  if (!ADMIN_OWNER_NICK) return res.status(503).json({ error: 'admin_not_configured' });
+  const { nick, password } = req.body || {};
+  const account = await verifyAdminServerPassword(nick, password);
+  if (!account) return res.status(401).json({ error: 'invalid_credentials' });
+
+  const token = String(randomInt(100000, 1000000));
+  db.prepare(`INSERT INTO admin_challenges(account_id,token_hash,expires_at,attempts)
+    VALUES(?,?,?,0) ON CONFLICT(account_id) DO UPDATE SET token_hash=excluded.token_hash,
+    expires_at=excluded.expires_at, attempts=0, created_at=datetime('now')`)
+    .run(account.id, sha256(token), Date.now() + 5 * 60000);
+  console.info(`[admin] token for ${account.display_nick}: ${token} (expires in 5 minutes)`);
+  res.json({ ok: true, setupRequired: !getAdminCredential(account.id) });
+});
+
+app.post('/v1/site/admin/setup', adminAuthLimit, async (req, res) => {
+  const { nick, password, token, adminPassword } = req.body || {};
+  const account = await verifyAdminServerPassword(nick, password);
+  if (!account) return res.status(401).json({ error: 'invalid_credentials' });
+  if (getAdminCredential(account.id)) return res.status(409).json({ error: 'admin_already_registered' });
+  if (typeof adminPassword !== 'string' || adminPassword.length < 12 || adminPassword.length > 128 || adminPassword === password)
+    return res.status(400).json({ error: 'invalid_admin_password' });
+  if (!consumeAdminToken(account.id, token)) return res.status(401).json({ error: 'invalid_or_expired_token' });
+
+  const credential = await hashPassword(adminPassword);
+  const result = db.prepare(`INSERT INTO admin_credentials(account_id,pw_iterations,pw_salt,pw_hash)
+    VALUES(?,?,?,?) ON CONFLICT(account_id) DO NOTHING`)
+    .run(account.id, credential.iterations, credential.salt, credential.hash);
+  if (result.changes !== 1) return res.status(409).json({ error: 'admin_already_registered' });
+  startAdminSession(res, account);
+  res.status(201).json({ ok: true, nick: account.display_nick });
+});
+
+app.post('/v1/site/admin/login', adminAuthLimit, async (req, res) => {
+  const { nick, password, token, adminPassword } = req.body || {};
+  const account = await verifyAdminServerPassword(nick, password);
+  if (!account) return res.status(401).json({ error: 'invalid_credentials' });
+  const credential = getAdminCredential(account.id);
+  if (!credential) return res.status(409).json({ error: 'admin_not_registered' });
+  if (typeof adminPassword !== 'string' || adminPassword.length > 128 || !(await verifyPassword(adminPassword, rec(credential))))
+    return res.status(401).json({ error: 'invalid_credentials' });
+  if (!consumeAdminToken(account.id, token)) return res.status(401).json({ error: 'invalid_or_expired_token' });
+  startAdminSession(res, account);
+  res.json({ ok: true, nick: account.display_nick });
+});
+
+app.get('/v1/site/admin/me', adminAuth, (req, res) => {
+  const account = db.prepare('SELECT display_nick FROM accounts WHERE id=?').get(req.adminAccountId);
+  res.json({ nick: account.display_nick });
+});
+
+app.post('/v1/site/admin/logout', (req, res) => {
+  const token = readAdminCookie(req);
+  if (token) db.prepare('DELETE FROM admin_sessions WHERE token_hash=?').run(sha256(token));
+  res.set('Set-Cookie', 'admin_sid=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0').json({ ok: true });
 });
 
 // ---------- NexoriaBridge (chave BRIDGE_KEY) ----------
