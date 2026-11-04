@@ -575,6 +575,20 @@ app.get('/v1/site/admin/store/transactions', adminAuth, storeTransactionAccess, 
   }) });
 });
 
+app.delete('/v1/site/admin/store/transactions', adminAuth, requireAdminRoles('owner'), (_req, res) => {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const pending = Number(db.prepare("SELECT COUNT(*) AS count FROM store_orders WHERE status='pending'").get().count);
+    const deleted = db.prepare("DELETE FROM store_orders WHERE status IN ('paid','failed')").run().changes;
+    db.exec('COMMIT');
+    audit(_req.adminNick, 'store_transactions_cleared', `deleted=${deleted};pending_preserved=${pending}`);
+    res.json({ ok: true, deleted, pendingPreserved: pending });
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+});
+
 function orderDeliveryStatus(status) {
   return status === 'error' ? 'failed' : 'pending';
 }
