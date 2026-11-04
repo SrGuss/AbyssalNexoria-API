@@ -129,14 +129,78 @@ app.get('/v1/site/store/catalog', (_req, res) => {
 const paymentLimit = rateLimit({ windowMs: 60000, max: 5, keyFn: (r) => `pay:${r.ip}:${r.accountId || ''}` });
 const paymentVerifyLimit = rateLimit({ windowMs: 60000, max: 8, keyFn: (r) => `pv:${r.ip}:${r.accountId || ''}:${r.params.id}` });
 const PIX_EXPIRATION_MS = 30 * 60 * 1000;
-function cleanupExpiredPixOrders() {
-  const deleted = db.prepare("DELETE FROM store_orders WHERE status='pending' AND payment_method_id='pix' AND expires_at IS NOT NULL AND expires_at<=?")
-    .run(Date.now()).changes;
-  if (deleted) audit('system', 'store_pix_expired', String(deleted));
+let pixCleanupRunning = false;
+async function cleanupExpiredPixOrders() {
+  if (pixCleanupRunning) return;
+  pixCleanupRunning = true;
+  const now = Date.now();
+  const expiredOrders = db.prepare("SELECT * FROM store_orders WHERE status='pending' AND expires_at IS NOT NULL AND expires_at<=?").all(now);
+  const accessToken = process.env.MP_ACCESS_TOKEN;
+  const mpBase = (process.env.MP_API_URL || 'https://api.mercadopago.com').replace(/\/$/, '');
+  try {
+    for (const order of expiredOrders) {
+      if (!order.payment_id) {
+        db.prepare("DELETE FROM store_orders WHERE id=? AND status='pending' AND expires_at<=?").run(order.id, now);
+        audit('system', 'store_pix_expired', order.id);
+        continue;
+      }
+      if (!accessToken) continue;
+      try {
+        const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
+        const response = await fetch(`${mpBase}/v1/payments/${encodeURIComponent(order.payment_id)}`, {
+          headers, signal: AbortSignal.timeout(10000),
+        });
+        if (response.status === 404) {
+          db.prepare("DELETE FROM store_orders WHERE id=? AND status='pending' AND expires_at<=?").run(order.id, now);
+          audit('system', 'store_pix_expired', order.id);
+          continue;
+        }
+        if (!response.ok) continue;
+        const payment = await response.json();
+        if (payment.external_reference !== order.id || payment.currency_id !== 'BRL'
+          || Math.round(Number(payment.transaction_amount) * 100) !== order.amount_cents) {
+          console.error('[mercadopago] expired order verification mismatch', order.id, String(payment.id || ''));
+          continue;
+        }
+        if (payment.status === 'approved') {
+          finalizeApprovedPayment(order, payment);
+          continue;
+        }
+        const methodId = String(payment.payment_method_id || order.payment_method_id || '').toLowerCase();
+        if (!methodId) continue;
+        if (methodId !== 'pix') {
+          db.prepare("UPDATE store_orders SET expires_at=NULL,payment_method_id=?,payment_type=COALESCE(?,payment_type) WHERE id=? AND status='pending'")
+            .run(methodId, payment.payment_type_id || null, order.id);
+          continue;
+        }
+        db.prepare("UPDATE store_orders SET payment_method_id='pix',payment_type=COALESCE(?,payment_type) WHERE id=? AND status='pending'")
+          .run(payment.payment_type_id || null, order.id);
+        if (['cancelled', 'expired', 'rejected'].includes(payment.status)) {
+          db.prepare("DELETE FROM store_orders WHERE id=? AND status='pending' AND expires_at<=?").run(order.id, now);
+          audit('system', 'store_pix_expired', order.id);
+          continue;
+        }
+        if (!['pending', 'in_process', 'authorized'].includes(payment.status)) continue;
+
+        const cancellation = await fetch(`${mpBase}/v1/payments/${encodeURIComponent(order.payment_id)}`, {
+          method: 'PUT', headers, body: JSON.stringify({ status: 'cancelled' }), signal: AbortSignal.timeout(10000),
+        });
+        const cancelledPayment = await cancellation.json().catch(() => ({}));
+        if (cancellation.ok && cancelledPayment.status === 'cancelled') {
+          db.prepare("DELETE FROM store_orders WHERE id=? AND status='pending' AND expires_at<=?").run(order.id, now);
+          audit('system', 'store_pix_expired', order.id);
+        }
+      } catch (error) {
+        console.error('[mercadopago] expired Pix cleanup failed', order.id, String(error?.message || error).slice(0, 120));
+      }
+    }
+  } finally {
+    pixCleanupRunning = false;
+  }
 }
-const pixCleanupTimer = setInterval(cleanupExpiredPixOrders, 30000);
+const pixCleanupTimer = setInterval(() => { cleanupExpiredPixOrders().catch(error => console.error('[store] Pix cleanup failed', error)); }, 30000);
 pixCleanupTimer.unref();
-cleanupExpiredPixOrders();
+cleanupExpiredPixOrders().catch(error => console.error('[store] Pix cleanup failed', error));
 
 function isValidCpf(value) {
   if (typeof value !== 'string' || !/^\d{11}$/.test(value) || /^([0-9])\1{10}$/.test(value)) return false;
@@ -311,15 +375,15 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
   }
 });
 
-app.get('/v1/site/store/orders/:id', siteAuth, (req, res) => {
-  cleanupExpiredPixOrders();
+app.get('/v1/site/store/orders/:id', siteAuth, async (req, res) => {
+  await cleanupExpiredPixOrders();
   const order = db.prepare('SELECT id,status FROM store_orders WHERE id=? AND account_id=?').get(req.params.id, req.accountId);
   if (!order) return res.sendStatus(404);
   res.json(order);
 });
 
 app.post('/v1/site/store/orders/:id/verify', siteAuth, paymentVerifyLimit, async (req, res) => {
-  cleanupExpiredPixOrders();
+  await cleanupExpiredPixOrders();
   const order = db.prepare('SELECT * FROM store_orders WHERE id=? AND account_id=?').get(req.params.id, req.accountId);
   if (!order) return res.sendStatus(404);
   if (order.status !== 'pending') return res.json({ id: order.id, status: order.status });
@@ -368,7 +432,7 @@ function validPaymentSignature(req, paymentId) {
 }
 
 app.post('/v1/site/payments/webhook', async (req, res) => {
-  cleanupExpiredPixOrders();
+  await cleanupExpiredPixOrders();
   const paymentId = req.query['data.id'] || req.body?.data?.id;
   if (!process.env.MP_ACCESS_TOKEN || !process.env.MP_WEBHOOK_SECRET) return res.sendStatus(503);
   if (!validPaymentSignature(req, paymentId)) return res.sendStatus(401);
@@ -558,8 +622,8 @@ app.put('/v1/site/admin/store/transactions/access', adminAuth, requireAdminRoles
     .map(row => ({ role: row.role, canView: Boolean(row.canView) })) });
 });
 
-app.get('/v1/site/admin/store/transactions', adminAuth, storeTransactionAccess, (req, res) => {
-  cleanupExpiredPixOrders();
+app.get('/v1/site/admin/store/transactions', adminAuth, storeTransactionAccess, async (req, res) => {
+  await cleanupExpiredPixOrders();
   const status = ['all', 'pending', 'paid', 'failed'].includes(req.query.status) ? req.query.status : 'all';
   const orders = db.prepare(`SELECT o.id,o.status,o.amount_cents AS amountCents,o.payment_id AS paymentId,
       o.payment_method_id AS paymentMethodId,o.payment_type AS paymentType,
@@ -593,13 +657,14 @@ app.get('/v1/site/admin/store/transactions', adminAuth, storeTransactionAccess, 
   }) });
 });
 
-app.delete('/v1/site/admin/store/transactions', adminAuth, requireAdminRoles('owner'), (_req, res) => {
+app.delete('/v1/site/admin/store/transactions', adminAuth, requireAdminRoles('owner'), async (req, res) => {
+  await cleanupExpiredPixOrders();
   db.exec('BEGIN IMMEDIATE');
   try {
     const pending = Number(db.prepare("SELECT COUNT(*) AS count FROM store_orders WHERE status='pending'").get().count);
     const deleted = db.prepare("DELETE FROM store_orders WHERE status IN ('paid','failed')").run().changes;
     db.exec('COMMIT');
-    audit(_req.adminNick, 'store_transactions_cleared', `deleted=${deleted};pending_preserved=${pending}`);
+    audit(req.adminNick, 'store_transactions_cleared', `deleted=${deleted};pending_preserved=${pending}`);
     res.json({ ok: true, deleted, pendingPreserved: pending });
   } catch (error) {
     db.exec('ROLLBACK');

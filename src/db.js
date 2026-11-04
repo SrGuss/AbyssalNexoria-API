@@ -172,6 +172,6 @@ if (!orderColumns.has('payment_type')) db.exec('ALTER TABLE store_orders ADD COL
 if (!orderColumns.has('expires_at')) db.exec('ALTER TABLE store_orders ADD COLUMN expires_at INTEGER');
 db.exec(`CREATE INDEX IF NOT EXISTS store_orders_expiration ON store_orders(status,expires_at);
 UPDATE store_orders SET expires_at=CAST(strftime('%s',created_at) AS INTEGER)*1000+1800000
-  WHERE status='pending' AND payment_method_id='pix' AND expires_at IS NULL;`);
+  WHERE status='pending' AND (payment_method_id='pix' OR payment_method_id IS NULL) AND expires_at IS NULL;`);
 export const audit = (actor, action, detail = '') =>
   db.prepare('INSERT INTO audit(actor,action,detail) VALUES(?,?,?)').run(actor, action, String(detail));
