@@ -136,11 +136,12 @@ app.get('/v1/site/me', siteAuth, (req, res) => {
 // ---------- Loja ----------
 const storeProductsQuery = `SELECT p.id,p.category_id AS categoryId,c.name AS category,p.name,p.description,
     p.price_cents AS priceCents,p.kind,p.vip_group AS vipGroup,p.duration_days AS durationDays,
-    p.product_code AS productCode,p.active
+    p.product_code AS productCode,p.delivery_type AS productType,p.delivery_quantity AS deliveryQuantity,
+    p.permanent_items_price_cents AS permanentItemsPriceCents,p.active
   FROM store_products p JOIN store_categories c ON c.id=p.category_id`;
 
 app.get('/v1/site/store/catalog', (_req, res) => {
-  const products = db.prepare(`${storeProductsQuery} WHERE p.active=1 ORDER BY c.name,p.name`).all();
+  const products = db.prepare(`${storeProductsQuery} WHERE p.active=1 AND p.delivery_type IN ('vip','key','kit','item') ORDER BY c.name,p.name`).all();
   const categories = [...new Map(products.map(product => [product.categoryId, { id: product.categoryId, name: product.category }])).values()];
   res.json({ categories, products });
 });
@@ -244,8 +245,14 @@ function finalizeApprovedPayment(order, payment) {
       for (const item of items) {
         const type = item.kind === 'vip' ? 'GRANT_VIP' : 'STORE_PRODUCT';
         const payload = JSON.stringify({
-          orderId: order.id, productId: item.product_id, productName: item.name, quantity: item.quantity,
-          group: item.vip_group, durationDays: item.duration_days, productCode: item.product_code,
+            orderId: order.id, productId: item.product_id, productName: item.name,
+            productType: item.delivery_type, productCode: item.product_code,
+            quantity: item.quantity * item.delivery_quantity, preserveItems: Boolean(item.preserve_items),
+            permanentItemsPriceCents: item.permanent_items_price_cents,
+            vip: item.delivery_type === 'vip' ? String(item.vip_group || '').toLowerCase() : undefined,
+            days: item.delivery_type === 'vip' && item.duration_days != null
+              ? item.duration_days * item.quantity : item.delivery_type === 'vip' ? 0 : undefined,
+            group: item.vip_group, durationDays: item.duration_days,
         });
         command.run(`mp:${payment.id}:${item.id}`, order.account_id, type, payload);
       }
@@ -290,18 +297,31 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
     return res.status(400).json({ error: 'invalid_payment_data' });
 
   const quantities = new Map();
+  const preserveSelections = new Map();
   for (const item of requested) {
     const id = Number(item?.id), quantity = Number(item?.quantity);
-    if (!Number.isSafeInteger(id) || id < 1 || !Number.isSafeInteger(quantity) || quantity < 1 || quantity > 99)
+    if (!Number.isSafeInteger(id) || id < 1 || !Number.isSafeInteger(quantity) || quantity < 1 || quantity > 99
+      || (item?.preserveItems !== undefined && typeof item.preserveItems !== 'boolean'))
       return res.status(400).json({ error: 'invalid_cart' });
     quantities.set(id, (quantities.get(id) || 0) + quantity);
+    preserveSelections.set(id, preserveSelections.get(id) || item.preserveItems === true);
   }
   if ([...quantities.values()].some(quantity => quantity > 99)) return res.status(400).json({ error: 'invalid_cart' });
 
   const ids = [...quantities.keys()];
   const products = db.prepare(`${storeProductsQuery} WHERE p.active=1 AND p.id IN (${ids.map(() => '?').join(',')})`).all(...ids);
   if (products.length !== ids.length) return res.status(400).json({ error: 'products_unavailable' });
-  const amountCents = products.reduce((sum, product) => sum + product.priceCents * quantities.get(product.id), 0);
+  if (products.some(product => !['vip', 'key', 'kit', 'item'].includes(product.productType)
+    || (product.productType === 'vip' && product.deliveryQuantity !== 1)
+    || (['kit', 'item'].includes(product.productType) && product.deliveryQuantity * quantities.get(product.id) > 64)
+    || (product.productType === 'key' && product.deliveryQuantity * quantities.get(product.id) > 10000)
+    || (preserveSelections.get(product.id) && (product.productType !== 'vip' || product.permanentItemsPriceCents < 1))))
+    return res.status(400).json({ error: 'products_unavailable' });
+  const amountCents = products.reduce((sum, product) => {
+    const quantity = quantities.get(product.id);
+    const preserveFee = preserveSelections.get(product.id) ? product.permanentItemsPriceCents : 0;
+    return sum + (product.priceCents + preserveFee) * quantity;
+  }, 0);
   if (!Number.isSafeInteger(amountCents) || amountCents < 100) return res.status(400).json({ error: 'invalid_total' });
 
   const expiresAt = methodId === 'pix' ? Date.now() + PIX_EXPIRATION_MS : null;
@@ -310,10 +330,13 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
   try {
     db.prepare('INSERT INTO store_orders(id,account_id,amount_cents,expires_at) VALUES(?,?,?,?)')
       .run(orderId, req.accountId, amountCents, expiresAt);
-    const insertItem = db.prepare(`INSERT INTO store_order_items(order_id,product_id,name,kind,vip_group,duration_days,product_code,price_cents,quantity)
-      VALUES(?,?,?,?,?,?,?,?,?)`);
+    const insertItem = db.prepare(`INSERT INTO store_order_items(order_id,product_id,name,kind,vip_group,duration_days,product_code,
+      delivery_type,delivery_quantity,preserve_items,permanent_items_price_cents,price_cents,quantity)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     for (const product of products) insertItem.run(orderId, product.id, product.name, product.kind, product.vipGroup,
-      product.durationDays, product.productCode, product.priceCents, quantities.get(product.id));
+      product.durationDays, product.productCode, product.productType, product.deliveryQuantity,
+      preserveSelections.get(product.id) ? 1 : 0, product.permanentItemsPriceCents,
+      product.priceCents, quantities.get(product.id));
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');
@@ -863,30 +886,48 @@ function storeProductInput(body) {
   const description = typeof body?.description === 'string' ? body.description.trim() : '';
   const categoryId = Number(body?.categoryId);
   const price = typeof body?.price === 'string' || typeof body?.price === 'number' ? String(body.price).trim() : '';
-  const kind = body?.kind;
+  const legacyKind = body?.kind;
+  const productType = ['vip', 'key', 'kit', 'item', 'other'].includes(body?.productType)
+    ? body.productType : legacyKind === 'vip' ? 'vip' : 'other';
   const vipGroup = typeof body?.vipGroup === 'string' ? body.vipGroup.trim() : '';
   const productCode = typeof body?.productCode === 'string' ? body.productCode.trim() : '';
   const durationDays = body?.durationDays === '' || body?.durationDays == null ? null : Number(body.durationDays);
+  const deliveryQuantity = body?.deliveryQuantity == null || body.deliveryQuantity === '' ? 1 : Number(body.deliveryQuantity);
+  const permanentItemsPrice = typeof body?.permanentItemsPrice === 'string' || typeof body?.permanentItemsPrice === 'number'
+    ? String(body.permanentItemsPrice).trim() : '0';
   if (name.length < 2 || name.length > 80 || description.length > 1000
     || !Number.isSafeInteger(categoryId) || categoryId < 1 || !/^\d{1,7}(\.\d{1,2})?$/.test(price)
-    || !['vip', 'product'].includes(kind)) return null;
+    || !Number.isSafeInteger(deliveryQuantity) || deliveryQuantity < 1 || deliveryQuantity > 64
+    || !/^\d{1,7}(\.\d{1,2})?$/.test(permanentItemsPrice)) return null;
   const priceCents = Math.round(Number(price) * 100);
+  const permanentItemsPriceCents = Math.round(Number(permanentItemsPrice) * 100);
+  const kind = productType === 'vip' ? 'vip' : 'product';
   if (!Number.isSafeInteger(priceCents) || priceCents < 100 || priceCents > 100000000) return null;
-  if (kind === 'vip' && !/^[A-Za-z0-9._-]{1,64}$/.test(vipGroup)) return null;
-  if (kind === 'product' && !/^[A-Za-z0-9._-]{1,64}$/.test(productCode)) return null;
+  if (!Number.isSafeInteger(permanentItemsPriceCents) || permanentItemsPriceCents < 0 || permanentItemsPriceCents > 100000000) return null;
+  if (productType === 'vip' && !/^[A-Za-z0-9_-]{2,32}$/.test(vipGroup.toLowerCase())) return null;
+  if (productType === 'vip' && deliveryQuantity !== 1) return null;
+  if (productType === 'key' && !/^[a-z0-9_-]{2,32}$/.test(productCode.toLowerCase())) return null;
+  if (['kit', 'item'].includes(productType) && !/^[a-z0-9_]{2,24}$/.test(productCode.toLowerCase())) return null;
+  if (productType === 'other' && !/^[A-Za-z0-9._-]{1,64}$/.test(productCode)) return null;
+  if (productType !== 'vip' && permanentItemsPriceCents !== 0) return null;
   if (durationDays != null && (!Number.isSafeInteger(durationDays) || durationDays < 1 || durationDays > 3650)) return null;
   if (!db.prepare('SELECT 1 FROM store_categories WHERE id=?').get(categoryId)) return null;
-  return { name, description, categoryId, priceCents, kind, vipGroup: kind === 'vip' ? vipGroup : null,
-    durationDays: kind === 'vip' ? durationDays : null, productCode: kind === 'product' ? productCode : null,
+  return { name, description, categoryId, priceCents, kind, productType,
+    vipGroup: productType === 'vip' ? vipGroup.toLowerCase() : null,
+    durationDays: productType === 'vip' ? durationDays : null,
+    productCode: productType === 'vip' ? null : productCode.toLowerCase(),
+    deliveryQuantity, permanentItemsPriceCents,
     active: body.active === false || body.active === 0 ? 0 : 1 };
 }
 
 app.post('/v1/site/admin/store/products', adminAuth, manageStore, (req, res) => {
   const product = storeProductInput(req.body);
   if (!product) return res.status(400).json({ error: 'invalid_product' });
-  const result = db.prepare(`INSERT INTO store_products(category_id,name,description,price_cents,kind,vip_group,duration_days,product_code,active)
-    VALUES(?,?,?,?,?,?,?,?,?)`).run(product.categoryId, product.name, product.description, product.priceCents,
-    product.kind, product.vipGroup, product.durationDays, product.productCode, product.active);
+  const result = db.prepare(`INSERT INTO store_products(category_id,name,description,price_cents,kind,vip_group,duration_days,
+    product_code,delivery_type,delivery_quantity,permanent_items_price_cents,active)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(product.categoryId, product.name, product.description, product.priceCents,
+    product.kind, product.vipGroup, product.durationDays, product.productCode, product.productType,
+    product.deliveryQuantity, product.permanentItemsPriceCents, product.active);
   audit(req.adminNick, 'store_product_created', product.name);
   res.status(201).json({ id: Number(result.lastInsertRowid) });
 });
@@ -894,9 +935,11 @@ app.post('/v1/site/admin/store/products', adminAuth, manageStore, (req, res) => 
 app.patch('/v1/site/admin/store/products/:id', adminAuth, manageStore, (req, res) => {
   const id = Number(req.params.id), product = storeProductInput(req.body);
   if (!Number.isSafeInteger(id) || id < 1 || !product) return res.status(400).json({ error: 'invalid_product' });
-  const result = db.prepare(`UPDATE store_products SET category_id=?,name=?,description=?,price_cents=?,kind=?,vip_group=?,duration_days=?,product_code=?,active=?,updated_at=datetime('now')
+  const result = db.prepare(`UPDATE store_products SET category_id=?,name=?,description=?,price_cents=?,kind=?,vip_group=?,duration_days=?,
+    product_code=?,delivery_type=?,delivery_quantity=?,permanent_items_price_cents=?,active=?,updated_at=datetime('now')
     WHERE id=?`).run(product.categoryId, product.name, product.description, product.priceCents,
-    product.kind, product.vipGroup, product.durationDays, product.productCode, product.active, id);
+    product.kind, product.vipGroup, product.durationDays, product.productCode, product.productType,
+    product.deliveryQuantity, product.permanentItemsPriceCents, product.active, id);
   if (!result.changes) return res.sendStatus(404);
   audit(req.adminNick, 'store_product_updated', product.name);
   res.json({ ok: true });

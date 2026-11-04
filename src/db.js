@@ -149,6 +149,9 @@ CREATE TABLE IF NOT EXISTS store_products (
   vip_group TEXT,
   duration_days INTEGER,
   product_code TEXT,
+  delivery_type TEXT NOT NULL DEFAULT 'other' CHECK(delivery_type IN ('vip','key','kit','item','other')),
+  delivery_quantity INTEGER NOT NULL DEFAULT 1 CHECK(delivery_quantity BETWEEN 1 AND 64),
+  permanent_items_price_cents INTEGER NOT NULL DEFAULT 0 CHECK(permanent_items_price_cents >= 0),
   active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -178,6 +181,10 @@ CREATE TABLE IF NOT EXISTS store_order_items (
   vip_group TEXT,
   duration_days INTEGER,
   product_code TEXT,
+  delivery_type TEXT NOT NULL DEFAULT 'other',
+  delivery_quantity INTEGER NOT NULL DEFAULT 1,
+  preserve_items INTEGER NOT NULL DEFAULT 0 CHECK(preserve_items IN (0,1)),
+  permanent_items_price_cents INTEGER NOT NULL DEFAULT 0,
   price_cents INTEGER NOT NULL,
   quantity INTEGER NOT NULL CHECK(quantity > 0)
 );
@@ -210,6 +217,17 @@ if (!orderColumns.has('payment_method_id')) db.exec('ALTER TABLE store_orders AD
 if (!orderColumns.has('payment_type')) db.exec('ALTER TABLE store_orders ADD COLUMN payment_type TEXT');
 if (!orderColumns.has('expires_at')) db.exec('ALTER TABLE store_orders ADD COLUMN expires_at INTEGER');
 if (!orderColumns.has('paid_at')) db.exec('ALTER TABLE store_orders ADD COLUMN paid_at INTEGER');
+const productColumns = new Set(db.prepare('PRAGMA table_info(store_products)').all().map(column => column.name));
+if (!productColumns.has('delivery_type')) db.exec("ALTER TABLE store_products ADD COLUMN delivery_type TEXT NOT NULL DEFAULT 'other'");
+if (!productColumns.has('delivery_quantity')) db.exec('ALTER TABLE store_products ADD COLUMN delivery_quantity INTEGER NOT NULL DEFAULT 1');
+if (!productColumns.has('permanent_items_price_cents')) db.exec('ALTER TABLE store_products ADD COLUMN permanent_items_price_cents INTEGER NOT NULL DEFAULT 0');
+db.exec("UPDATE store_products SET delivery_type='vip' WHERE kind='vip' AND delivery_type='other'");
+const orderItemColumns = new Set(db.prepare('PRAGMA table_info(store_order_items)').all().map(column => column.name));
+if (!orderItemColumns.has('delivery_type')) db.exec("ALTER TABLE store_order_items ADD COLUMN delivery_type TEXT NOT NULL DEFAULT 'other'");
+if (!orderItemColumns.has('delivery_quantity')) db.exec('ALTER TABLE store_order_items ADD COLUMN delivery_quantity INTEGER NOT NULL DEFAULT 1');
+if (!orderItemColumns.has('preserve_items')) db.exec('ALTER TABLE store_order_items ADD COLUMN preserve_items INTEGER NOT NULL DEFAULT 0 CHECK(preserve_items IN (0,1))');
+if (!orderItemColumns.has('permanent_items_price_cents')) db.exec('ALTER TABLE store_order_items ADD COLUMN permanent_items_price_cents INTEGER NOT NULL DEFAULT 0');
+db.exec("UPDATE store_order_items SET delivery_type='vip' WHERE kind='vip' AND delivery_type='other'");
 db.exec(`CREATE INDEX IF NOT EXISTS store_orders_expiration ON store_orders(status,expires_at);
 UPDATE store_orders SET expires_at=CAST(strftime('%s',created_at) AS INTEGER)*1000+1800000
   WHERE status='pending' AND (payment_method_id='pix' OR payment_method_id IS NULL) AND expires_at IS NULL;
