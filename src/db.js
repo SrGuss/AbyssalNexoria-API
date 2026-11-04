@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS store_orders (
   payment_id TEXT UNIQUE,
   payment_method_id TEXT,
   payment_type TEXT,
+  expires_at INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -168,5 +169,9 @@ INSERT OR IGNORE INTO store_transaction_access(role_key,can_view) VALUES('admin'
 const orderColumns = new Set(db.prepare('PRAGMA table_info(store_orders)').all().map(column => column.name));
 if (!orderColumns.has('payment_method_id')) db.exec('ALTER TABLE store_orders ADD COLUMN payment_method_id TEXT');
 if (!orderColumns.has('payment_type')) db.exec('ALTER TABLE store_orders ADD COLUMN payment_type TEXT');
+if (!orderColumns.has('expires_at')) db.exec('ALTER TABLE store_orders ADD COLUMN expires_at INTEGER');
+db.exec(`CREATE INDEX IF NOT EXISTS store_orders_expiration ON store_orders(status,expires_at);
+UPDATE store_orders SET expires_at=CAST(strftime('%s',created_at) AS INTEGER)*1000+1800000
+  WHERE status='pending' AND payment_method_id='pix' AND expires_at IS NULL;`);
 export const audit = (actor, action, detail = '') =>
   db.prepare('INSERT INTO audit(actor,action,detail) VALUES(?,?,?)').run(actor, action, String(detail));

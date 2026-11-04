@@ -128,6 +128,16 @@ app.get('/v1/site/store/catalog', (_req, res) => {
 
 const paymentLimit = rateLimit({ windowMs: 60000, max: 5, keyFn: (r) => `pay:${r.ip}:${r.accountId || ''}` });
 const paymentVerifyLimit = rateLimit({ windowMs: 60000, max: 8, keyFn: (r) => `pv:${r.ip}:${r.accountId || ''}:${r.params.id}` });
+const PIX_EXPIRATION_MS = 30 * 60 * 1000;
+function cleanupExpiredPixOrders() {
+  const deleted = db.prepare("DELETE FROM store_orders WHERE status='pending' AND payment_method_id='pix' AND expires_at IS NOT NULL AND expires_at<=?")
+    .run(Date.now()).changes;
+  if (deleted) audit('system', 'store_pix_expired', String(deleted));
+}
+const pixCleanupTimer = setInterval(cleanupExpiredPixOrders, 30000);
+pixCleanupTimer.unref();
+cleanupExpiredPixOrders();
+
 function isValidCpf(value) {
   if (typeof value !== 'string' || !/^\d{11}$/.test(value) || /^([0-9])\1{10}$/.test(value)) return false;
   const checkDigit = length => {
@@ -211,10 +221,12 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
   const amountCents = products.reduce((sum, product) => sum + product.priceCents * quantities.get(product.id), 0);
   if (!Number.isSafeInteger(amountCents) || amountCents < 100) return res.status(400).json({ error: 'invalid_total' });
 
+  const expiresAt = methodId === 'pix' ? Date.now() + PIX_EXPIRATION_MS : null;
   const orderId = randomUUID();
   db.exec('BEGIN IMMEDIATE');
   try {
-    db.prepare('INSERT INTO store_orders(id,account_id,amount_cents) VALUES(?,?,?)').run(orderId, req.accountId, amountCents);
+    db.prepare('INSERT INTO store_orders(id,account_id,amount_cents,expires_at) VALUES(?,?,?,?)')
+      .run(orderId, req.accountId, amountCents, expiresAt);
     const insertItem = db.prepare(`INSERT INTO store_order_items(order_id,product_id,name,kind,vip_group,duration_days,product_code,price_cents,quantity)
       VALUES(?,?,?,?,?,?,?,?,?)`);
     for (const product of products) insertItem.run(orderId, product.id, product.name, product.kind, product.vipGroup,
@@ -237,6 +249,7 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
       external_reference: orderId,
       notification_url: webhookUrl,
     };
+    if (expiresAt) paymentRequest.date_of_expiration = new Date(expiresAt).toISOString();
     if (/^[a-z0-9_-]{1,16}$/i.test(identificationType) && /^\d{5,20}$/.test(identificationNumber))
       paymentRequest.payer.identification = { type: identificationType, number: identificationNumber };
     for (const key of ['first_name', 'last_name']) {
@@ -285,6 +298,7 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
     }
     res.status(data.status === 'approved' ? 201 : 202).json({
       orderId, status: data.status, statusDetail: data.status_detail || null,
+      expiresAt,
       pixQrCode: data.point_of_interaction?.transaction_data?.qr_code || null,
       pixQrCodeBase64: data.point_of_interaction?.transaction_data?.qr_code_base64 || null,
       ticketUrl: data.transaction_details?.external_resource_url || null,
@@ -298,12 +312,14 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
 });
 
 app.get('/v1/site/store/orders/:id', siteAuth, (req, res) => {
+  cleanupExpiredPixOrders();
   const order = db.prepare('SELECT id,status FROM store_orders WHERE id=? AND account_id=?').get(req.params.id, req.accountId);
   if (!order) return res.sendStatus(404);
   res.json(order);
 });
 
 app.post('/v1/site/store/orders/:id/verify', siteAuth, paymentVerifyLimit, async (req, res) => {
+  cleanupExpiredPixOrders();
   const order = db.prepare('SELECT * FROM store_orders WHERE id=? AND account_id=?').get(req.params.id, req.accountId);
   if (!order) return res.sendStatus(404);
   if (order.status !== 'pending') return res.json({ id: order.id, status: order.status });
@@ -352,6 +368,7 @@ function validPaymentSignature(req, paymentId) {
 }
 
 app.post('/v1/site/payments/webhook', async (req, res) => {
+  cleanupExpiredPixOrders();
   const paymentId = req.query['data.id'] || req.body?.data?.id;
   if (!process.env.MP_ACCESS_TOKEN || !process.env.MP_WEBHOOK_SECRET) return res.sendStatus(503);
   if (!validPaymentSignature(req, paymentId)) return res.sendStatus(401);
@@ -542,10 +559,11 @@ app.put('/v1/site/admin/store/transactions/access', adminAuth, requireAdminRoles
 });
 
 app.get('/v1/site/admin/store/transactions', adminAuth, storeTransactionAccess, (req, res) => {
+  cleanupExpiredPixOrders();
   const status = ['all', 'pending', 'paid', 'failed'].includes(req.query.status) ? req.query.status : 'all';
   const orders = db.prepare(`SELECT o.id,o.status,o.amount_cents AS amountCents,o.payment_id AS paymentId,
       o.payment_method_id AS paymentMethodId,o.payment_type AS paymentType,
-      o.created_at AS createdAt,o.updated_at AS updatedAt,a.display_nick AS player,
+      o.created_at AS createdAt,o.updated_at AS updatedAt,o.expires_at AS expiresAt,a.display_nick AS player,
       COUNT(DISTINCT i.id) AS itemCount,
       COUNT(DISTINCT CASE WHEN c.status='done' THEN i.id END) AS deliveredCount
     FROM store_orders o JOIN accounts a ON a.id=o.account_id
