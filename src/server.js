@@ -143,8 +143,9 @@ function finalizeApprovedPayment(order, payment) {
   const items = db.prepare('SELECT * FROM store_order_items WHERE order_id=?').all(order.id);
   db.exec('BEGIN IMMEDIATE');
   try {
-    const updated = db.prepare(`UPDATE store_orders SET status='paid',payment_id=?,updated_at=datetime('now')
-      WHERE id=? AND status='pending'`).run(String(payment.id), order.id);
+    const updated = db.prepare(`UPDATE store_orders SET status='paid',payment_id=?,payment_method_id=COALESCE(?,payment_method_id),
+      payment_type=COALESCE(?,payment_type),updated_at=datetime('now') WHERE id=? AND status='pending'`)
+      .run(String(payment.id), payment.payment_method_id || null, payment.payment_type_id || null, order.id);
     if (updated.changes) {
       const command = db.prepare('INSERT OR IGNORE INTO commands(event_id,account_id,type,payload) VALUES(?,?,?,?)');
       for (const item of items) {
@@ -259,7 +260,8 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
         description: String(cause?.description || '').slice(0, 160),
       })) : [];
       console.error('[mercadopago] payment request rejected', response.status, JSON.stringify({ message: data.message, causes }));
-      db.prepare("UPDATE store_orders SET status='failed',updated_at=datetime('now') WHERE id=? AND status='pending'").run(orderId);
+        db.prepare("UPDATE store_orders SET status='failed',payment_method_id=?,payment_type=?,updated_at=datetime('now') WHERE id=? AND status='pending'")
+          .run(methodId, typeof form.checkout_payment_type === 'string' ? form.checkout_payment_type.slice(0, 40) : null, orderId);
       return res.status(402).json({
         error: 'payment_rejected',
         statusDetail: typeof data.status_detail === 'string' ? data.status_detail.slice(0, 80) : null,
@@ -273,8 +275,9 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
       finalizeApprovedPayment(order, data);
     } else {
       const status = ['rejected', 'cancelled'].includes(data.status) ? 'failed' : 'pending';
-      db.prepare("UPDATE store_orders SET status=?,payment_id=?,updated_at=datetime('now') WHERE id=? AND status='pending'")
-        .run(status, String(data.id), orderId);
+      db.prepare("UPDATE store_orders SET status=?,payment_id=?,payment_method_id=?,payment_type=?,updated_at=datetime('now') WHERE id=? AND status='pending'")
+        .run(status, String(data.id), data.payment_method_id || methodId,
+          typeof form.checkout_payment_type === 'string' ? form.checkout_payment_type.slice(0, 40) : data.payment_type_id || null, orderId);
       if (status === 'failed') return res.status(402).json({
         error: 'payment_rejected',
         statusDetail: typeof data.status_detail === 'string' ? data.status_detail.slice(0, 80) : null,
@@ -288,7 +291,8 @@ app.post('/v1/site/store/payments', siteAuth, paymentLimit, async (req, res) => 
     });
   } catch (error) {
     console.error('[mercadopago] payment request failed', String(error?.message || error).slice(0, 200));
-    db.prepare("UPDATE store_orders SET status='failed',updated_at=datetime('now') WHERE id=? AND status='pending'").run(orderId);
+    db.prepare("UPDATE store_orders SET status='failed',payment_method_id=?,payment_type=?,updated_at=datetime('now') WHERE id=? AND status='pending'")
+      .run(methodId, typeof form.checkout_payment_type === 'string' ? form.checkout_payment_type.slice(0, 40) : null, orderId);
     res.status(502).json({ error: 'checkout_unavailable' });
   }
 });
@@ -505,6 +509,76 @@ app.get('/v1/site/admin/me', adminAuth, (req, res) => {
 });
 
 const manageStore = requireAdminRoles('owner', 'admin');
+function storeTransactionAccess(req, res, next) {
+  if (req.adminRole === 'owner') return next();
+  const access = db.prepare('SELECT can_view FROM store_transaction_access WHERE role_key=?').get(req.adminRole);
+  return access?.can_view ? next() : res.status(403).json({ error: 'forbidden' });
+}
+
+app.get('/v1/site/admin/store/transactions/access', adminAuth, (req, res) => {
+  const roles = db.prepare('SELECT role_key AS role,can_view AS canView FROM store_transaction_access ORDER BY role_key').all()
+    .map(row => ({ role: row.role, canView: Boolean(row.canView) }));
+  const current = roles.find(row => row.role === req.adminRole);
+  res.json({ canView: req.adminRole === 'owner' || Boolean(current?.canView), roles: req.adminRole === 'owner' ? roles : undefined });
+});
+
+app.put('/v1/site/admin/store/transactions/access', adminAuth, requireAdminRoles('owner'), (req, res) => {
+  const roles = req.body?.roles;
+  const allowed = new Set(['admin', 'moderator', 'helper']);
+  if (!Array.isArray(roles) || roles.some(role => typeof role !== 'string' || !allowed.has(role)))
+    return res.status(400).json({ error: 'invalid_transaction_access' });
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const update = db.prepare("UPDATE store_transaction_access SET can_view=?,updated_at=datetime('now') WHERE role_key=?");
+    for (const role of allowed) update.run(roles.includes(role) ? 1 : 0, role);
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  audit(req.adminNick, 'store_transaction_access_updated', [...new Set(roles)].sort().join(','));
+  res.json({ ok: true, roles: db.prepare('SELECT role_key AS role,can_view AS canView FROM store_transaction_access ORDER BY role_key').all()
+    .map(row => ({ role: row.role, canView: Boolean(row.canView) })) });
+});
+
+app.get('/v1/site/admin/store/transactions', adminAuth, storeTransactionAccess, (req, res) => {
+  const status = ['all', 'pending', 'paid', 'failed'].includes(req.query.status) ? req.query.status : 'all';
+  const orders = db.prepare(`SELECT o.id,o.status,o.amount_cents AS amountCents,o.payment_id AS paymentId,
+      o.payment_method_id AS paymentMethodId,o.payment_type AS paymentType,
+      o.created_at AS createdAt,o.updated_at AS updatedAt,a.display_nick AS player,
+      COUNT(DISTINCT i.id) AS itemCount,
+      COUNT(DISTINCT CASE WHEN c.status='done' THEN i.id END) AS deliveredCount
+    FROM store_orders o JOIN accounts a ON a.id=o.account_id
+    LEFT JOIN store_order_items i ON i.order_id=o.id
+    LEFT JOIN commands c ON c.event_id=('mp:' || o.payment_id || ':' || i.id)
+    WHERE ?='all' OR o.status=?
+    GROUP BY o.id ORDER BY o.created_at DESC LIMIT 200`).all(status, status);
+  if (orders.length === 0) return res.json({ orders: [] });
+
+  const ids = orders.map(order => order.id);
+  const items = db.prepare(`SELECT i.order_id AS orderId,i.product_id AS productId,i.name,i.kind,
+      i.price_cents AS priceCents,i.quantity,c.status AS deliveryStatus
+    FROM store_order_items i
+    JOIN store_orders o ON o.id=i.order_id
+    LEFT JOIN commands c ON c.event_id=('mp:' || o.payment_id || ':' || i.id)
+    WHERE i.order_id IN (${ids.map(() => '?').join(',')}) ORDER BY i.id`).all(...ids);
+  const byOrder = new Map(orders.map(order => [order.id, []]));
+  for (const item of items) byOrder.get(item.orderId)?.push({
+    ...item, deliveryStatus: item.deliveryStatus === 'done' ? 'delivered' : orderDeliveryStatus(item.deliveryStatus),
+  });
+  res.json({ orders: orders.map(order => {
+    const orderItems = byOrder.get(order.id) || [];
+    const deliveredCount = Number(order.deliveredCount);
+    const deliveryStatus = order.status !== 'paid' ? 'not_paid'
+      : deliveredCount === Number(order.itemCount) ? 'delivered' : deliveredCount ? 'partial' : 'pending';
+    return { ...order, deliveryStatus, items: orderItems };
+  }) });
+});
+
+function orderDeliveryStatus(status) {
+  return status === 'error' ? 'failed' : 'pending';
+}
+
 app.get('/v1/site/admin/store', adminAuth, manageStore, (_req, res) => {
   const categories = db.prepare('SELECT id,name FROM store_categories ORDER BY name').all();
   const products = db.prepare(`${storeProductsQuery} ORDER BY c.name,p.name`).all();

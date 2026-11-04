@@ -139,9 +139,12 @@ CREATE TABLE IF NOT EXISTS store_orders (
   amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
   preference_id TEXT,
   payment_id TEXT UNIQUE,
+  payment_method_id TEXT,
+  payment_type TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE INDEX IF NOT EXISTS store_orders_recent ON store_orders(created_at DESC, status);
 CREATE TABLE IF NOT EXISTS store_order_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   order_id TEXT NOT NULL REFERENCES store_orders(id) ON DELETE CASCADE,
@@ -154,6 +157,16 @@ CREATE TABLE IF NOT EXISTS store_order_items (
   price_cents INTEGER NOT NULL,
   quantity INTEGER NOT NULL CHECK(quantity > 0)
 );
+CREATE TABLE IF NOT EXISTS store_transaction_access (
+  role_key TEXT PRIMARY KEY CHECK(role_key IN ('admin','moderator','helper')),
+  can_view INTEGER NOT NULL DEFAULT 0 CHECK(can_view IN (0,1)),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT OR IGNORE INTO store_transaction_access(role_key,can_view) VALUES('admin',1),('moderator',0),('helper',0);
 `);
+
+const orderColumns = new Set(db.prepare('PRAGMA table_info(store_orders)').all().map(column => column.name));
+if (!orderColumns.has('payment_method_id')) db.exec('ALTER TABLE store_orders ADD COLUMN payment_method_id TEXT');
+if (!orderColumns.has('payment_type')) db.exec('ALTER TABLE store_orders ADD COLUMN payment_type TEXT');
 export const audit = (actor, action, detail = '') =>
   db.prepare('INSERT INTO audit(actor,action,detail) VALUES(?,?,?)').run(actor, action, String(detail));
