@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS store_orders (
   payment_method_id TEXT,
   payment_type TEXT,
   expires_at INTEGER,
+  paid_at INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -164,14 +165,27 @@ CREATE TABLE IF NOT EXISTS store_transaction_access (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 INSERT OR IGNORE INTO store_transaction_access(role_key,can_view) VALUES('admin',1),('moderator',0),('helper',0);
+CREATE TABLE IF NOT EXISTS store_expenses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  expense_date TEXT NOT NULL,
+  category TEXT NOT NULL,
+  description TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS store_expenses_month ON store_expenses(expense_date, id);
 `);
 
 const orderColumns = new Set(db.prepare('PRAGMA table_info(store_orders)').all().map(column => column.name));
 if (!orderColumns.has('payment_method_id')) db.exec('ALTER TABLE store_orders ADD COLUMN payment_method_id TEXT');
 if (!orderColumns.has('payment_type')) db.exec('ALTER TABLE store_orders ADD COLUMN payment_type TEXT');
 if (!orderColumns.has('expires_at')) db.exec('ALTER TABLE store_orders ADD COLUMN expires_at INTEGER');
+if (!orderColumns.has('paid_at')) db.exec('ALTER TABLE store_orders ADD COLUMN paid_at INTEGER');
 db.exec(`CREATE INDEX IF NOT EXISTS store_orders_expiration ON store_orders(status,expires_at);
 UPDATE store_orders SET expires_at=CAST(strftime('%s',created_at) AS INTEGER)*1000+1800000
-  WHERE status='pending' AND (payment_method_id='pix' OR payment_method_id IS NULL) AND expires_at IS NULL;`);
+  WHERE status='pending' AND (payment_method_id='pix' OR payment_method_id IS NULL) AND expires_at IS NULL;
+UPDATE store_orders SET paid_at=CAST(strftime('%s',updated_at) AS INTEGER)*1000
+  WHERE status='paid' AND paid_at IS NULL;`);
 export const audit = (actor, action, detail = '') =>
   db.prepare('INSERT INTO audit(actor,action,detail) VALUES(?,?,?)').run(actor, action, String(detail));

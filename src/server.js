@@ -218,8 +218,8 @@ function finalizeApprovedPayment(order, payment) {
   db.exec('BEGIN IMMEDIATE');
   try {
     const updated = db.prepare(`UPDATE store_orders SET status='paid',payment_id=?,payment_method_id=COALESCE(?,payment_method_id),
-      payment_type=COALESCE(?,payment_type),updated_at=datetime('now') WHERE id=? AND status='pending'`)
-      .run(String(payment.id), payment.payment_method_id || null, payment.payment_type_id || null, order.id);
+      payment_type=COALESCE(?,payment_type),paid_at=COALESCE(paid_at,?),updated_at=datetime('now') WHERE id=? AND status='pending'`)
+      .run(String(payment.id), payment.payment_method_id || null, payment.payment_type_id || null, Date.now(), order.id);
     if (updated.changes) {
       const command = db.prepare('INSERT OR IGNORE INTO commands(event_id,account_id,type,payload) VALUES(?,?,?,?)');
       for (const item of items) {
@@ -655,6 +655,80 @@ app.get('/v1/site/admin/store/transactions', adminAuth, storeTransactionAccess, 
       : deliveredCount === Number(order.itemCount) ? 'delivered' : deliveredCount ? 'partial' : 'pending';
     return { ...order, deliveryStatus, items: orderItems };
   }) });
+});
+
+function currentBrasiliaMonth() {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit' })
+    .formatToParts(new Date());
+  const year = parts.find(part => part.type === 'year')?.value;
+  const month = parts.find(part => part.type === 'month')?.value;
+  return `${year}-${month}`;
+}
+
+function financeMonthRange(value) {
+  const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(value || '') ? value : currentBrasiliaMonth();
+  const [year, monthNumber] = month.split('-').map(Number);
+  const startUtc = Date.UTC(year, monthNumber - 1, 1) + 3 * 60 * 60 * 1000;
+  const endUtc = Date.UTC(year, monthNumber, 1) + 3 * 60 * 60 * 1000;
+  const next = new Date(Date.UTC(year, monthNumber, 1));
+  const expenseStart = `${month}-01`;
+  const expenseEnd = `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, '0')}-01`;
+  return { month, startUtc, endUtc, expenseStart, expenseEnd };
+}
+
+app.get('/v1/site/admin/store/finance', adminAuth, storeTransactionAccess, async (req, res) => {
+  await cleanupExpiredPixOrders();
+  const range = financeMonthRange(String(req.query.month || ''));
+  const income = db.prepare(`SELECT COALESCE(SUM(amount_cents),0) AS totalCents,COUNT(*) AS count
+    FROM store_orders WHERE status='paid' AND paid_at>=? AND paid_at<?`).get(range.startUtc, range.endUtc);
+  const expenseTotals = db.prepare(`SELECT COALESCE(SUM(amount_cents),0) AS totalCents,COUNT(*) AS count
+    FROM store_expenses WHERE expense_date>=? AND expense_date<?`).get(range.expenseStart, range.expenseEnd);
+  const expenses = db.prepare(`SELECT id,expense_date AS expenseDate,category,description,amount_cents AS amountCents,
+      created_by AS createdBy,created_at AS createdAt FROM store_expenses
+    WHERE expense_date>=? AND expense_date<? ORDER BY expense_date DESC,id DESC LIMIT 500`)
+    .all(range.expenseStart, range.expenseEnd);
+  const sales = db.prepare(`SELECT o.id,a.display_nick AS player,o.amount_cents AS amountCents,o.paid_at AS paidAt,
+      o.payment_method_id AS paymentMethodId,o.payment_type AS paymentType
+    FROM store_orders o JOIN accounts a ON a.id=o.account_id
+    WHERE o.status='paid' AND o.paid_at>=? AND o.paid_at<? ORDER BY o.paid_at DESC LIMIT 500`)
+    .all(range.startUtc, range.endUtc);
+  const incomeCents = Number(income.totalCents), expenseCents = Number(expenseTotals.totalCents);
+  res.json({
+    month: range.month,
+    summary: {
+      incomeCents, expenseCents, balanceCents: incomeCents - expenseCents,
+      salesCount: Number(income.count), expenseCount: Number(expenseTotals.count),
+    },
+    sales, expenses,
+  });
+});
+
+app.post('/v1/site/admin/store/finance/expenses', adminAuth, storeTransactionAccess, (req, res) => {
+  const { expenseDate, category, description } = req.body || {};
+  const date = typeof expenseDate === 'string' ? expenseDate : '';
+  const expenseCategory = typeof category === 'string' ? category.trim() : '';
+  const expenseDescription = typeof description === 'string' ? description.trim() : '';
+  const amountCents = Number(req.body?.amountCents);
+  const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date)
+    && new Date(`${date}T00:00:00.000Z`).toISOString().slice(0, 10) === date;
+  if (!validDate || expenseCategory.length < 2 || expenseCategory.length > 40
+    || expenseDescription.length < 2 || expenseDescription.length > 180
+    || !Number.isSafeInteger(amountCents) || amountCents < 1 || amountCents > 1000000000)
+    return res.status(400).json({ error: 'invalid_expense' });
+  const result = db.prepare(`INSERT INTO store_expenses(expense_date,category,description,amount_cents,created_by)
+    VALUES(?,?,?,?,?)`).run(date, expenseCategory, expenseDescription, amountCents, req.adminNick);
+  audit(req.adminNick, 'store_expense_created', `${date}:${expenseCategory}:${amountCents}`);
+  res.status(201).json({ id: Number(result.lastInsertRowid) });
+});
+
+app.delete('/v1/site/admin/store/finance/expenses/:id', adminAuth, storeTransactionAccess, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ error: 'invalid_expense' });
+  const expense = db.prepare('SELECT expense_date,category,amount_cents FROM store_expenses WHERE id=?').get(id);
+  if (!expense) return res.sendStatus(404);
+  db.prepare('DELETE FROM store_expenses WHERE id=?').run(id);
+  audit(req.adminNick, 'store_expense_deleted', `${id}:${expense.expense_date}:${expense.category}:${expense.amount_cents}`);
+  res.json({ ok: true });
 });
 
 app.delete('/v1/site/admin/store/transactions', adminAuth, requireAdminRoles('owner'), async (req, res) => {
