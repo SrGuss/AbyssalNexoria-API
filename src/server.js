@@ -5,6 +5,7 @@ import { db, audit } from './db.js';
 import { sendEmail, verifyEmailTransport } from './services/emailService.js';
 import { accessCodeEmail } from './templates/accessCodeEmail.js';
 import { createAuthRoutes } from './routes/authRoutes.js';
+import { createVipConfigService } from './services/vipConfigService.js';
 import {
   hashPassword, verifyPassword, dummyVerify, TARGET_ITERATIONS, sha256, safeEqualStr, newToken,
   requireKey, rateLimit, NICK_RE, normNick
@@ -34,6 +35,7 @@ const adminAuthLimit = rateLimit({ windowMs: 15 * 60000, max: 10, keyFn: (r) => 
 const getAccount = (nick) => db.prepare('SELECT * FROM accounts WHERE nick = ?').get(normNick(nick));
 const rec = (a) => ({ iterations: a.pw_iterations, salt: a.pw_salt, hash: a.pw_hash });
 const ADMIN_OWNER_NICK = normNick(process.env.ADMIN_OWNER_NICK || '');
+const vipConfigService = createVipConfigService(db, audit);
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
@@ -1216,14 +1218,126 @@ app.put('/v1/bridge/luckperms/groups', bridgeKey, (req, res) => {
 
 // ---------- Plugin de VIP (chave VIP_KEY): fila de comandos ----------
 const vipKey = requireKey('VIP_KEY');
+app.get('/v1/site/admin/vip/config', adminAuth, manageStore, (_req, res) => {
+  res.json(vipConfigService.read());
+});
+
+app.put('/v1/site/admin/vip/config', adminAuth, manageStore, (req, res) => {
+  if (!vipConfigService.read().initialized)
+    return res.status(409).json({ error: 'vip_config_not_initialized' });
+  const expectedRevision = Number(req.body?.expectedRevision);
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
+    return res.status(400).json({ error: 'invalid_vip_config_revision' });
+  const result = vipConfigService.write(expectedRevision, req.body?.config, req.adminNick);
+  if (!result.ok) return res.status(result.error === 'vip_config_conflict' ? 409 : 400).json({ error: result.error, revision: result.revision });
+  res.json({ revision: result.revision, config: result.config });
+});
+
+app.get('/v1/site/admin/vip/player/:nick', adminAuth, manageStore, (req, res) => {
+  const account = getAccount(req.params.nick);
+  if (!account) return res.status(404).json({ error: 'account_not_found' });
+  const row = db.prepare('SELECT data FROM profiles WHERE account_id=?').get(account.id);
+  let profile = {};
+  try { profile = row ? JSON.parse(row.data) : {}; } catch { profile = {}; }
+  res.json({
+    nick: account.display_nick,
+    online: Boolean(profile.online),
+    vip: profile.vip || null,
+    vipExpiresAt: profile.vipExpiresAt || null,
+    vips: Array.isArray(profile.vips) ? profile.vips : [],
+  });
+});
+
+app.get('/v1/site/admin/vip/actions', adminAuth, manageStore, (_req, res) => {
+  const rows = db.prepare(`SELECT c.id,c.event_id AS eventId,c.type,c.payload,c.status,c.result,
+      c.created_at AS createdAt,c.done_at AS doneAt,a.display_nick AS nick FROM commands c
+    JOIN accounts a ON a.id=c.account_id
+    WHERE c.event_id LIKE 'site-vip-admin:%' ORDER BY c.id DESC LIMIT 50`).all();
+  res.json({ actions: rows.map(row => ({ ...row, payload: JSON.parse(row.payload) })) });
+});
+
+app.post('/v1/site/admin/vip/actions', adminAuth, manageStore, (req, res) => {
+  const action = req.body?.action;
+  const config = vipConfigService.read().config;
+  let account = null;
+  const payload = { action, actor: req.adminNick };
+  if (action === 'sync_groups') {
+    account = db.prepare('SELECT id,display_nick FROM accounts WHERE id=?').get(req.adminAccountId);
+  } else {
+    const nick = typeof req.body?.nick === 'string' ? req.body.nick.trim() : '';
+    account = NICK_RE.test(nick) ? getAccount(nick) : null;
+    if (!account) return res.status(404).json({ error: 'account_not_found' });
+  }
+  if (action === 'grant_vip' || action === 'revoke_vip') {
+    const vip = typeof req.body?.vip === 'string' ? req.body.vip.toLowerCase() : '';
+    if (!config.vips.some(entry => entry.id === vip)) return res.status(400).json({ error: 'vip_not_found' });
+    payload.vip = vip;
+    if (action === 'grant_vip') {
+      const days = Number(req.body?.days);
+      if (!Number.isSafeInteger(days) || days < 0 || days > 3650) return res.status(400).json({ error: 'invalid_vip_duration' });
+      payload.days = days;
+    }
+  } else if (action === 'give_kit' || action === 'reset_kit') {
+    const kit = typeof req.body?.kit === 'string' ? req.body.kit.toLowerCase() : '';
+    if (!config.kits.some(entry => entry.id === kit)) return res.status(400).json({ error: 'kit_not_found' });
+    payload.kit = kit;
+    if (action === 'give_kit') {
+      const quantity = Number(req.body?.quantity ?? 1);
+      if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 64) return res.status(400).json({ error: 'invalid_quantity' });
+      payload.quantity = quantity;
+    }
+  } else if (action === 'give_keys') {
+    const crate = typeof req.body?.crate === 'string' ? req.body.crate.toLowerCase() : '';
+    if (!config.crates.some(entry => entry.id === crate)) return res.status(400).json({ error: 'crate_not_found' });
+    const quantity = Number(req.body?.quantity);
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 10000) return res.status(400).json({ error: 'invalid_quantity' });
+    payload.crate = crate;
+    payload.quantity = quantity;
+  } else if (action !== 'sync_groups') return res.status(400).json({ error: 'invalid_vip_action' });
+
+  const eventId = `site-vip-admin:${randomUUID()}`;
+  const result = db.prepare('INSERT INTO commands(event_id,account_id,type,payload) VALUES(?,?,?,?)')
+    .run(eventId, account.id, 'VIP_ADMIN_ACTION', JSON.stringify(payload));
+  audit(req.adminNick, 'vip_admin_action_queued', `${action}:${account.display_nick}`);
+  res.status(202).json({ id: Number(result.lastInsertRowid), eventId, status: 'pending' });
+});
+
+app.get('/v1/vip/config', vipKey, (req, res) => {
+  const requestedRevision = req.query.revision === undefined ? 0 : Number(req.query.revision);
+  if (!Number.isSafeInteger(requestedRevision) || requestedRevision < 0)
+    return res.status(400).json({ error: 'invalid_vip_config_revision' });
+  const current = vipConfigService.read();
+  res.json({ revision: current.revision, config: requestedRevision < current.revision ? current.config : null });
+});
+
+app.put('/v1/vip/config', vipKey, (req, res) => {
+  const expectedRevision = Number(req.body?.expectedRevision);
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
+    return res.status(400).json({ error: 'invalid_vip_config_revision' });
+  const result = vipConfigService.write(expectedRevision, req.body?.config);
+  if (!result.ok) return res.status(result.error === 'vip_config_conflict' ? 409 : 400).json({ error: result.error, revision: result.revision });
+  vipConfigService.markApplied(result.revision);
+  res.json({ revision: result.revision });
+});
+
+app.post('/v1/vip/config/applied', vipKey, (req, res) => {
+  const revision = Number(req.body?.revision);
+  if (!Number.isSafeInteger(revision) || revision < 0) return res.status(400).json({ error: 'invalid_vip_config_revision' });
+  if (!vipConfigService.markApplied(revision)) return res.status(409).json({ error: 'vip_config_revision_mismatch' });
+  res.json({ ok: true });
+});
+
 app.get('/v1/vip/commands', vipKey, (_req, res) => {
   const rows = db.prepare(`SELECT c.id,c.event_id,c.type,c.payload,a.display_nick AS nick,a.uuid
     FROM commands c JOIN accounts a ON a.id=c.account_id WHERE c.status='pending' ORDER BY c.id LIMIT 50`).all();
   res.json({ commands: rows.map(r => ({ ...r, payload: JSON.parse(r.payload) })) });
 });
 app.post('/v1/vip/commands/:id/ack', vipKey, (req, res) => {
-  db.prepare("UPDATE commands SET status='done', done_at=datetime('now') WHERE id=?").run(req.params.id);
-  res.json({ ok: true });
+  const status = req.body?.status === 'error' ? 'error' : 'done';
+  const result = typeof req.body?.result === 'string' ? req.body.result.trim().slice(0, 500) : null;
+  const updated = db.prepare("UPDATE commands SET status=?,result=?,done_at=datetime('now') WHERE id=?")
+    .run(status, result, req.params.id);
+  res.json({ ok: true, changed: updated.changes === 1 });
 });
 
 app.use((err, _req, res, _next) => { console.error(err); res.status(500).json({ error: 'internal' }); });

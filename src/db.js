@@ -127,7 +127,16 @@ CREATE TABLE IF NOT EXISTS commands (
   payload TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  done_at TEXT
+  done_at TEXT,
+  result TEXT
+);
+CREATE TABLE IF NOT EXISTS vip_plugin_config (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  revision INTEGER NOT NULL DEFAULT 0,
+  applied_revision INTEGER NOT NULL DEFAULT 0,
+  applied_at TEXT,
+  config TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -205,6 +214,12 @@ CREATE TABLE IF NOT EXISTS store_expenses (
 );
 CREATE INDEX IF NOT EXISTS store_expenses_month ON store_expenses(expense_date, id);
 `);
+
+const commandColumns = new Set(db.prepare('PRAGMA table_info(commands)').all().map(column => column.name));
+if (!commandColumns.has('result')) db.exec('ALTER TABLE commands ADD COLUMN result TEXT');
+const vipConfigColumns = new Set(db.prepare('PRAGMA table_info(vip_plugin_config)').all().map(column => column.name));
+if (!vipConfigColumns.has('applied_revision')) db.exec('ALTER TABLE vip_plugin_config ADD COLUMN applied_revision INTEGER NOT NULL DEFAULT 0');
+if (!vipConfigColumns.has('applied_at')) db.exec('ALTER TABLE vip_plugin_config ADD COLUMN applied_at TEXT');
 
 const accountColumns = new Set(db.prepare('PRAGMA table_info(accounts)').all().map(column => column.name));
 if (!accountColumns.has('email')) db.exec('ALTER TABLE accounts ADD COLUMN email TEXT');
