@@ -6,5 +6,5 @@
   "main": "src/server.js",
   "scripts": { "start": "node src/server.js", "import": "node scripts/import-users.js" },
   "engines": { "node": ">=22.13" },
-  "dependencies": { "express": "^4.21.2" }
+  "dependencies": { "dotenv": "^18.0.9", "express": "^4.21.2", "nodemailer": "^10.3.1" }
 }

@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   pw_iterations INTEGER NOT NULL,
   pw_salt TEXT NOT NULL,
   pw_hash TEXT NOT NULL,
+  email TEXT,
+  email_verified INTEGER NOT NULL DEFAULT 0 CHECK(email_verified IN (0,1)),
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS profiles (
@@ -30,6 +32,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at INTEGER NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS email_access_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  purpose TEXT NOT NULL CHECK(purpose IN ('email_link','site_login')),
+  code_hash TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  consumed_at INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS email_access_codes_lookup ON email_access_codes(account_id,purpose,created_at DESC);
+CREATE INDEX IF NOT EXISTS email_access_codes_expiry ON email_access_codes(expires_at);
 CREATE TABLE IF NOT EXISTS admin_credentials (
   account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   pw_iterations INTEGER NOT NULL,
@@ -43,6 +58,13 @@ CREATE TABLE IF NOT EXISTS admin_staff (
   created_by INTEGER NOT NULL REFERENCES accounts(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS email_registration_policy (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  required INTEGER NOT NULL DEFAULT 0 CHECK(required IN (0,1)),
+  deadline_hours INTEGER NOT NULL DEFAULT 72 CHECK(deadline_hours BETWEEN 1 AND 720),
+  enabled_at INTEGER
+);
+INSERT OR IGNORE INTO email_registration_policy(id,required,deadline_hours,enabled_at) VALUES(1,0,72,NULL);
 CREATE TABLE IF NOT EXISTS admin_challenges (
   account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   token_hash TEXT NOT NULL,
@@ -176,6 +198,12 @@ CREATE TABLE IF NOT EXISTS store_expenses (
 );
 CREATE INDEX IF NOT EXISTS store_expenses_month ON store_expenses(expense_date, id);
 `);
+
+const accountColumns = new Set(db.prepare('PRAGMA table_info(accounts)').all().map(column => column.name));
+if (!accountColumns.has('email')) db.exec('ALTER TABLE accounts ADD COLUMN email TEXT');
+if (!accountColumns.has('email_verified')) db.exec('ALTER TABLE accounts ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0');
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS accounts_verified_email_unique ON accounts(lower(email))
+  WHERE email IS NOT NULL AND email_verified=1;`);
 
 const orderColumns = new Set(db.prepare('PRAGMA table_info(store_orders)').all().map(column => column.name));
 if (!orderColumns.has('payment_method_id')) db.exec('ALTER TABLE store_orders ADD COLUMN payment_method_id TEXT');

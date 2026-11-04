@@ -1,6 +1,10 @@
+import 'dotenv/config';
 import express from 'express';
 import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { db, audit } from './db.js';
+import { sendEmail, verifyEmailTransport } from './services/emailService.js';
+import { accessCodeEmail } from './templates/accessCodeEmail.js';
+import { createAuthRoutes } from './routes/authRoutes.js';
 import {
   hashPassword, verifyPassword, dummyVerify, TARGET_ITERATIONS, sha256, safeEqualStr, newToken,
   requireKey, rateLimit, NICK_RE, normNick
@@ -85,33 +89,48 @@ const HOURS = Number(process.env.SESSION_HOURS || 24);
 const cookieOpts = `HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${HOURS * 3600}`;
 const readCookie = (req) => (req.get('cookie') || '').split(';').map(s => s.trim()).find(s => s.startsWith('sid='))?.slice(4);
 
+function createSiteSession(res, account) {
+  const token = newToken();
+  db.prepare('INSERT INTO sessions(token_hash,account_id,expires_at) VALUES(?,?,?)')
+    .run(sha256(token), account.id, Date.now() + HOURS * 3600000);
+  res.set('Set-Cookie', `sid=${token}; ${cookieOpts}`);
+}
+
 app.post('/v1/site/login', ipLimit, loginLimit, async (req, res) => {
   const { nick, password } = req.body || {};
   const a = getAccount(nick);
   const ok = a ? await verifyPassword(String(password || ''), rec(a)) : await dummyVerify(String(password || ''));
   if (!a || !ok) return res.status(401).json({ error: 'invalid_credentials' });
   await upgradeHash(a, password);
-  const token = newToken();
-  db.prepare('INSERT INTO sessions(token_hash,account_id,expires_at) VALUES(?,?,?)')
-    .run(sha256(token), a.id, Date.now() + HOURS * 3600000);
-  res.set('Set-Cookie', `sid=${token}; ${cookieOpts}`).json({ ok: true, nick: a.display_nick });
+  createSiteSession(res, a);
+  res.json({ ok: true, nick: a.display_nick });
 });
 
 function siteAuth(req, res, next) {
   const t = readCookie(req);
   const s = t && db.prepare('SELECT * FROM sessions WHERE token_hash=?').get(sha256(t));
   if (!s || s.expires_at < Date.now()) return res.status(401).json({ error: 'unauthenticated' });
-  req.accountId = s.account_id; next();
+  const account = db.prepare('SELECT id,display_nick,created_at,email_verified FROM accounts WHERE id=?').get(s.account_id);
+  if (!account) return res.status(401).json({ error: 'unauthenticated' });
+  const deadline = emailRegistrationDeadline(account);
+  const path = req.originalUrl.split('?')[0];
+  const canRegisterEmail = path === '/v1/site/me' || /^\/v1\/site\/auth\/email-code\/link\/(request|verify)$/.test(path);
+  if (!account.email_verified && deadline !== null && deadline <= Date.now() && !canRegisterEmail)
+    return res.status(403).json({ error: 'email_registration_required' });
+  req.accountId = s.account_id;
+  next();
 }
+app.use('/v1/site/auth', createAuthRoutes({ db, audit, sendEmail, accessCodeEmail, createSiteSession, siteAuth, rateLimit }));
 app.post('/v1/site/logout', (req, res) => {
   const t = readCookie(req);
   if (t) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(sha256(t));
   res.set('Set-Cookie', 'sid=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0').json({ ok: true });
 });
 app.get('/v1/site/me', siteAuth, (req, res) => {
-  const a = db.prepare('SELECT id,display_nick FROM accounts WHERE id=?').get(req.accountId);
+  const a = db.prepare('SELECT id,display_nick,created_at AS createdAt,email,email_verified AS emailVerified FROM accounts WHERE id=?').get(req.accountId);
   const p = db.prepare('SELECT data,updated_at FROM profiles WHERE account_id=?').get(req.accountId);
-  res.json({ nick: a.display_nick, profile: p ? JSON.parse(p.data) : null, updatedAt: p?.updated_at || null });
+  const emailDeadline = emailRegistrationDeadline({ ...a, id: req.accountId, created_at: a.createdAt });
+  res.json({ nick: a.display_nick, email: a.email || null, emailVerified: Boolean(a.emailVerified), emailRequired: emailDeadline !== null, emailDeadline, profile: p ? JSON.parse(p.data) : null, updatedAt: p?.updated_at || null });
 });
 
 // ---------- Loja ----------
@@ -470,11 +489,34 @@ const readAdminCookie = (req) => (req.get('cookie') || '').split(';').map(s => s
 const getAdminCredential = (accountId) => db.prepare('SELECT * FROM admin_credentials WHERE account_id=?').get(accountId);
 
 function adminStaff(accountId) {
-  return db.prepare('SELECT role_key FROM admin_staff WHERE account_id=?').get(accountId);
+  return db.prepare('SELECT role_key,created_at FROM admin_staff WHERE account_id=?').get(accountId);
 }
 
 function isAdminOwner(account) {
   return !!(ADMIN_OWNER_NICK && account && normNick(account.display_nick) === ADMIN_OWNER_NICK);
+}
+
+function sqliteTimestamp(value) {
+  const timestamp = Date.parse(`${String(value || '').replace(' ', 'T')}Z`);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function emailRegistrationDeadline(account) {
+  const deadlines = [];
+  const staff = adminStaff(account.id);
+  if (staff || isAdminOwner(account))
+    deadlines.push(sqliteTimestamp(staff?.created_at || account.created_at) + 72 * 60 * 60 * 1000);
+  const policy = db.prepare('SELECT required,deadline_hours AS deadlineHours,enabled_at AS enabledAt FROM email_registration_policy WHERE id=1').get();
+  if (policy?.required) {
+    const startedAt = Math.max(sqliteTimestamp(account.created_at), policy.enabledAt || 0);
+    deadlines.push(startedAt + policy.deadlineHours * 60 * 60 * 1000);
+  }
+  return deadlines.length ? Math.min(...deadlines) : null;
+}
+
+function maskEmail(value) {
+  const [local, domain] = String(value || '').split('@');
+  return local && domain ? `${local[0]}***@${domain}` : '';
 }
 
 async function verifyAdminServerPassword(nick, password) {
@@ -522,6 +564,10 @@ function adminAuth(req, res, next) {
   const staff = adminStaff(session.account_id);
   if (!account || !getAdminCredential(session.account_id) || (!isAdminOwner(account) && !staff))
     return res.status(401).json({ error: 'admin_access_revoked' });
+  const emailState = db.prepare('SELECT created_at AS createdAt,email_verified AS emailVerified FROM accounts WHERE id=?').get(session.account_id);
+  const deadline = emailRegistrationDeadline({ ...account, ...emailState, created_at: emailState.createdAt });
+  if (!emailState.emailVerified && deadline !== null && deadline <= Date.now())
+    return res.status(403).json({ error: 'email_registration_required' });
   req.adminAccountId = session.account_id;
   req.adminNick = account.display_nick;
   req.adminRole = isAdminOwner(account) ? 'owner' : staff.role_key;
@@ -543,14 +589,20 @@ app.post('/v1/site/admin/token', adminTokenLimit, async (req, res) => {
   const { nick, password } = req.body || {};
   const account = await verifyAdminServerPassword(nick, password);
   if (!account) return res.status(401).json({ error: 'invalid_credentials' });
+  if (!account.email || !account.email_verified) return res.status(409).json({ error: 'email_required' });
 
   const token = String(randomInt(100000, 1000000));
   db.prepare(`INSERT INTO admin_challenges(account_id,token_hash,expires_at,attempts)
     VALUES(?,?,?,0) ON CONFLICT(account_id) DO UPDATE SET token_hash=excluded.token_hash,
     expires_at=excluded.expires_at, attempts=0, created_at=datetime('now')`)
     .run(account.id, sha256(token), Date.now() + 5 * 60000);
-  console.info(`[admin] token for ${account.display_nick}: ${token} (expires in 5 minutes)`);
-  res.json({ ok: true, setupRequired: !getAdminCredential(account.id) });
+  try {
+    await sendEmail({ to: account.email, ...accessCodeEmail({ code: token, purpose: 'admin_login' }) });
+  } catch {
+    db.prepare('DELETE FROM admin_challenges WHERE account_id=?').run(account.id);
+    return res.status(503).json({ error: 'email_unavailable' });
+  }
+  res.json({ ok: true, setupRequired: !getAdminCredential(account.id), emailHint: maskEmail(account.email) });
 });
 
 app.post('/v1/site/admin/setup', adminAuthLimit, async (req, res) => {
@@ -587,6 +639,23 @@ app.post('/v1/site/admin/login', adminAuthLimit, async (req, res) => {
 app.get('/v1/site/admin/me', adminAuth, (req, res) => {
   const account = db.prepare('SELECT display_nick FROM accounts WHERE id=?').get(req.adminAccountId);
   res.json({ nick: account.display_nick, role: req.adminRole });
+});
+
+app.get('/v1/site/admin/security/email-policy', adminAuth, requireAdminRoles('owner'), (_req, res) => {
+  const policy = db.prepare('SELECT required,deadline_hours AS deadlineHours FROM email_registration_policy WHERE id=1').get();
+  res.json({ required: Boolean(policy.required), deadlineHours: policy.deadlineHours });
+});
+
+app.patch('/v1/site/admin/security/email-policy', adminAuth, requireAdminRoles('owner'), (req, res) => {
+  const { required, deadlineHours } = req.body || {};
+  if (typeof required !== 'boolean' || !Number.isInteger(deadlineHours) || deadlineHours < 1 || deadlineHours > 720)
+    return res.status(400).json({ error: 'invalid_email_policy' });
+  const current = db.prepare('SELECT required,enabled_at AS enabledAt FROM email_registration_policy WHERE id=1').get();
+  const enabledAt = required ? (current.required ? current.enabledAt : Date.now()) : null;
+  db.prepare('UPDATE email_registration_policy SET required=?,deadline_hours=?,enabled_at=? WHERE id=1')
+    .run(required ? 1 : 0, deadlineHours, enabledAt);
+  audit(req.adminNick, 'admin_email_policy_updated', `${required}:${deadlineHours}`);
+  res.json({ ok: true, required, deadlineHours });
 });
 
 const manageStore = requireAdminRoles('owner', 'admin');
@@ -844,9 +913,9 @@ app.delete('/v1/site/admin/store/products/:id', adminAuth, manageStore, (req, re
 
 app.get('/v1/site/admin/staff', adminAuth, requireAdminRoles('owner'), (_req, res) => {
   const staff = db.prepare(`SELECT a.display_nick AS nick, s.role_key AS role, s.created_at AS createdAt,
-      EXISTS(SELECT 1 FROM admin_credentials c WHERE c.account_id=a.id) AS configured
+      a.email_verified AS emailVerified, EXISTS(SELECT 1 FROM admin_credentials c WHERE c.account_id=a.id) AS configured
     FROM admin_staff s JOIN accounts a ON a.id=s.account_id ORDER BY lower(a.display_nick)`).all();
-  res.json({ staff });
+  res.json({ staff: staff.map(member => ({ ...member, emailVerified: Boolean(member.emailVerified) })) });
 });
 
 app.post('/v1/site/admin/staff', adminAuth, requireAdminRoles('owner'), (req, res) => {
@@ -1116,4 +1185,7 @@ app.post('/v1/vip/commands/:id/ack', vipKey, (req, res) => {
 
 app.use((err, _req, res, _next) => { console.error(err); res.status(500).json({ error: 'internal' }); });
 const port = Number(process.env.PORT || 80);
-app.listen(port, '0.0.0.0', () => console.log(`API ouvindo em ${port}`));
+app.listen(port, '0.0.0.0', () => {
+  console.log(`API ouvindo em ${port}`);
+  verifyEmailTransport().catch(() => {});
+});
